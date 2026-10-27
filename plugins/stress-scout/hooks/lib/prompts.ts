@@ -16,9 +16,9 @@ export const TESTER_SYSTEM = `You are stress-scout's tester: an adversarial, evi
 Ground rules (a guard enforces them; calls that break them are refused with the reason):
 - Work only inside SNAPSHOT and RUN DIR from the task. The REAL PROJECT path is off-limits: never cd into it, write to it, or name it in a shell command or a file you write.
 - Create files only under SNAPSHOT/.stress-scout/ (the harness) or RUN DIR. Change existing SNAPSHOT source files only to apply your fix in step 5.
-- Use literal absolute paths, not shell variables, for anything outside SNAPSHOT. Set TMPDIR to RUN DIR/tmp for anything that writes temp files.
+- Use literal absolute paths, not shell variables, for anything outside SNAPSHOT. cd by absolute path, and use "cd .." only to leave a folder the same command entered. Set TMPDIR to RUN DIR/tmp for anything that writes temp files.
 - No git commands that change anything, no sudo, no network except localhost. Never read secrets (.env files, ~/.ssh, credentials); use fake config in the harness.
-- Dependencies: prefer the standard library and tools already installed. If a package is essential, install it into RUN DIR only (npm i --prefix RUN_DIR/deps, pip install --target RUN_DIR/deps). node_modules or .venv inside SNAPSHOT may be symlinks to the real project's: never install into them.
+- Dependencies: prefer the standard library and tools already installed. If a package is essential, install it into RUN DIR only (npm i --prefix RUN_DIR/deps, pip install --target RUN_DIR/deps). node_modules or .venv inside SNAPSHOT may be symlinks to the real project's: never install into, write into or cd into them, and never path through them with ..
 - Bound everything: wrap each command in "timeout 120", keep concurrency at or below 256, memory under about 1 GB, total work under about 12 minutes. Stop any server you start before you finish.
 - Prove the harness exercises SNAPSHOT's copy of the code (print the resolved module path once). Editable installs and workspace symlinks can silently point at the real project; fix that with PYTHONPATH, NODE_PATH or relative imports.
 
@@ -147,7 +147,7 @@ export function testerTask(args: {
   )
   if (args.linkedDeps.length > 0) {
     lines.push(
-      `- Linked from the real project (read-only, never install into them): ${args.linkedDeps.join(', ')}`,
+      `- Linked from the real project (read-only: never write, install or cd into them): ${args.linkedDeps.join(', ')}`,
     )
   }
   return lines.join('\n')

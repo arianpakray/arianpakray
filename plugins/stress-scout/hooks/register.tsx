@@ -35,13 +35,12 @@ import {
   churn,
   diffStat,
   diffText,
-  fingerprint,
+  fingerprintOrRebuild,
   headTree,
   listTree,
   makeSnapshot,
   openShadow,
   patchOf,
-  resetShadow,
   type Shadow,
 } from './lib/shadow'
 import { ago, basename, clip, clockTime, compactTokens, fnv, isInside, oneLine, slug, trimSlash } from './lib/util'
@@ -345,10 +344,11 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
       if (input.run_in_background === true) return refuse('run commands in the foreground, wrapped in timeout')
       if (input.dangerouslyDisableSandbox === true) return refuse('the sandbox stays on')
       return checkBash(text('command'), box)
-    case 'Read':
-    case 'Glob':
-    case 'Grep':
-      return checkRead(text('file_path') || text('path'), box)
+    case 'Read': {
+      const path = text('file_path')
+      const real = path.startsWith('/') ? (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath : undefined
+      return checkRead(path, box, real)
+    }
     case 'Write':
       return checkWrite(await placed($, text('file_path')), text('content'), box)
     case 'Edit':
@@ -383,15 +383,11 @@ async function triage($: $, prompt: string): Promise<{ plan?: Triage; tokens: nu
   return plan === undefined ? { tokens, error: 'triage reply was unreadable' } : { plan, tokens }
 }
 
-async function fingerprintOrReset($: $, c: Ctx): Promise<string> {
-  try {
-    return await fingerprint($, c.shadow)
-  } catch (error) {
-    if (messageOf(error).includes('.lock')) throw error
-    await resetShadow($, c.shadow)
-    c.shadow = await openShadow($, c.root, c.scratch)
-    return fingerprint($, c.shadow)
-  }
+/** The project's tree as it stands, through a shadow that is rebuilt when damaged. */
+async function currentTree($: $, c: Ctx): Promise<string> {
+  const { shadow, tree } = await fingerprintOrRebuild($, c.shadow)
+  c.shadow = shadow
+  return tree
 }
 
 async function hashesOf($: $, c: Ctx, tree: string, keys: readonly string[]): Promise<Map<string, string>> {
@@ -666,7 +662,7 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     return
   }
   await setPhase($, 'triage', focus !== undefined ? clip(focus, 60) : trigger)
-  const tree = await fingerprintOrReset($, c)
+  const tree = await currentTree($, c)
   live.seenTree = tree
   const memory = await loadMemory($, c)
   const intent = await recentIntent($)
@@ -889,7 +885,7 @@ async function heartbeat($: $): Promise<void> {
     if ((await read($, phaseAtom)).kind !== 'off') await setPhase($, 'off', live.ctxError)
     return
   }
-  const tree = await fingerprintOrReset($, c).catch(() => '')
+  const tree = await currentTree($, c).catch(() => '')
   if (tree === '') return
   const now = await $.clock.now()
   if (tree !== live.seenTree) {
@@ -919,10 +915,25 @@ async function apply($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
   if (finding === undefined) return `No finding #${id}.`
   if (finding.patch === '' && finding.nextStep === '') return `Finding #${id} has no fix to hand over.`
-  await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status: 'applied' as const } : f)))
-  await update($, seenAtom, seen => Math.max(seen, id))
-  await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now()), asUser: true })
-  return `Handed finding #${id} to Claude.`
+  // /stress apply's hook holds the turn a submitted prompt waits on: hand over once the command has answered
+  $.clock.after(0, () => void handOff($, finding))
+  return `Handing finding #${id} to Claude.`
+}
+
+/** Submits the handoff as the person's prompt; the finding counts as applied once it entered. */
+async function handOff($: $, finding: Finding): Promise<void> {
+  try {
+    const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now()), asUser: true })
+    if (entered.drop !== undefined) {
+      await log($, `#${finding.id} was not handed over: ${entered.drop}`)
+      return
+    }
+    await update($, findingsAtom, list => list.map(f => (f.id === finding.id ? { ...f, status: 'applied' as const } : f)))
+    await update($, seenAtom, seen => Math.max(seen, finding.id))
+  } catch (error) {
+    await log($, `#${finding.id} was not handed over: ${messageOf(error)}`)
+    $.ui.toast(`stress-scout could not hand #${finding.id} to Claude: ${clip(messageOf(error), 120)}`, { timeoutMs: 8000 })
+  }
 }
 
 async function dismiss($: $, id: number): Promise<string> {

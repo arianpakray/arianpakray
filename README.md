@@ -58,9 +58,9 @@ The tester is a separate headless Claude Code process:
 - Its working directory is the snapshot, so your project is outside its allowed directories.
 - It has only Bash, Read, Write and Edit, with no MCP servers or skills, and doesn't load your project's settings.
 - It runs with `--permission-mode dontAsk`, so any call the stress-scout guard doesn't approve is refused.
-- The guard allows writes only inside the run folder and never lets the tester touch or name your real project. It also blocks reading secrets (`.env`, `~/.ssh`, credentials), network access beyond localhost, global installs, history-changing git commands and `sudo`.
+- The guard allows writes only inside the run folder and never lets the tester touch or name your real project, including through the snapshot's links to your `node_modules` or `.venv`. It also blocks reading secrets (`.env`, `~/.ssh`, credentials, however the path is spelled or globbed), network access beyond localhost, global installs, history-changing git commands and `sudo`.
 
-The guard is a seatbelt, not a security boundary. For OS-level isolation, also turn on Claude Code's sandbox (`/sandbox`). Scratch data (snapshots and a shadow git index) lives in `$TMPDIR/stress-scout/`, and your repository's `.git` is never written to.
+The guard is a seatbelt, not a security boundary. For OS-level isolation, also turn on Claude Code's sandbox (`/sandbox`). Scratch data (snapshots and a shadow git index) lives in `$TMPDIR/stress-scout/`. Nothing in your repository's `.git` is created or changed; git only refreshes the timestamps of objects the shadow index reuses from it.
 
 ## Develop
 

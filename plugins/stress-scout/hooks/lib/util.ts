@@ -30,6 +30,43 @@ export const isInside = (path: string, dir: string): boolean => {
   return path === base || path.startsWith(`${base}/`)
 }
 
+/**
+ * `path` with `//`, `/./` and `x/..` folded the way the OS reads them (links
+ * aside): what a spelling like `/home/u/x/../.ssh` really names. A relative
+ * path keeps the `..` that climb above its start.
+ */
+export function normalizePath(path: string): string {
+  const isAbsolute = path.startsWith('/')
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..' && parts.length > 0 && parts.at(-1) !== '..') parts.pop()
+    else if (part !== '..' || !isAbsolute) parts.push(part)
+  }
+  const joined = parts.join('/')
+  return isAbsolute ? `/${joined}` : joined === '' ? '.' : joined
+}
+
+const queues = new Map<string, Promise<unknown>>()
+
+/**
+ * Runs `task` after every earlier task of the same `key` settled: one writer
+ * per key at a time. Not reentrant: a task that waits on its own key never
+ * starts, so code inside one calls the unwrapped work directly.
+ */
+export function exclusive<T>(key: string, task: () => Promise<T>): Promise<T> {
+  const run = (queues.get(key) ?? Promise.resolve()).then(() => task())
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  queues.set(key, tail)
+  void tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key)
+  })
+  return run
+}
+
 export function ago(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000))
   if (seconds < 60) return `${seconds}s`

@@ -10,6 +10,7 @@
 import type { EngineInterface, ProcessRunResult } from 'claude-code'
 
 import { parseChurn, parseLsTree, type TreeFile } from './rank'
+import { exclusive } from './util'
 
 export const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
@@ -92,10 +93,24 @@ const EXCLUDES = [
   '.env.*',
   '*.pem',
   '*.key',
+  '*.p12',
+  '*.pfx',
+  '*.keystore',
+  '*.jks',
+  'id_rsa*',
+  'id_dsa*',
+  'id_ecdsa*',
+  'id_ed25519*',
 ]
 
 /** Dependency folders an ignored install lives in: linked, not copied, into a snapshot. */
 export const DEP_DIRS = ['node_modules', '.venv', 'venv', 'vendor', 'bower_components']
+
+/** Where a run's snapshot lives inside its run folder. */
+export const snapshotOf = (runDir: string): string => `${runDir.replace(/\/+$/, '')}/snapshot`
+
+/** Older than any write of ours (each is killed at 3 minutes): a lock a git left when it died mid-write. */
+const STALE_LOCK_MS = 10 * 60_000
 
 /** Lockfiles and other diff noise left out of the triage diff. */
 const DIFF_NOISE = [
@@ -129,6 +144,9 @@ export type Shadow = {
 type GitOptions = { workTree?: string; index?: string; timeoutMs?: number; isTolerant?: boolean }
 
 export class GitError extends Error {}
+
+/** Another git process holds the shadow index: try again later rather than rebuild under it. */
+export class ShadowLocked extends GitError {}
 
 /** Git against the shadow repository, the project (or a snapshot) as its work tree. */
 async function git(
@@ -174,8 +192,16 @@ async function projectGit($: EngineInterface, root: string, args: readonly strin
   })
 }
 
-/** Opens (creating on first use) the shadow repository for `root` under `scratch`. */
-export async function openShadow($: EngineInterface, root: string, scratch: string): Promise<Shadow> {
+/**
+ * Opens (creating on first use) the shadow repository for `root` under `scratch`.
+ * Like every write to the shadow, it waits for the one before it on that scratch:
+ * the shadow index admits a single writer, and a heartbeat can meet a cycle.
+ */
+export function openShadow($: EngineInterface, root: string, scratch: string): Promise<Shadow> {
+  return exclusive(scratch, () => openShadowNow($, root, scratch))
+}
+
+async function openShadowNow($: EngineInterface, root: string, scratch: string): Promise<Shadow> {
   const gitDir = `${scratch}/shadow.git`
   const common = await projectGit($, root, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
   const isProjectGit = common.exitCode === 0 && common.stdout.trim() !== ''
@@ -189,19 +215,51 @@ export async function openShadow($: EngineInterface, root: string, scratch: stri
   return shadow
 }
 
-/** Forgets the shadow's index and objects, for when they no longer match the project. */
-export async function resetShadow($: EngineInterface, shadow: Shadow): Promise<void> {
-  for (const path of [shadow.gitDir, shadow.index]) {
+/** Forgets the shadow's index, its lock and its objects, for when they no longer match the project. */
+async function resetShadowNow($: EngineInterface, shadow: Shadow): Promise<void> {
+  for (const path of [shadow.gitDir, shadow.index, `${shadow.index}.lock`]) {
     if (path.startsWith(`${shadow.scratch}/`)) await $.process.run(['rm', '-rf', path], { timeoutMs: 60_000 })
   }
 }
 
-/** The tree id of the working tree as it stands: equal ids mean nothing changed. */
-export async function fingerprint($: EngineInterface, shadow: Shadow): Promise<string> {
-  await git($, shadow, ['add', '-A', '--ignore-errors', '--', '.'], { timeoutMs: 180_000, isTolerant: true })
+/**
+ * The tree id of the working tree as it stands (equal ids mean nothing
+ * changed), and the shadow it was read through: rebuilt from scratch first
+ * when it is damaged (its scratch folder cleaned, a git killed mid-write).
+ * One exclusive section, so no other writer meets the shadow half rebuilt.
+ */
+export function fingerprintOrRebuild($: EngineInterface, shadow: Shadow): Promise<{ shadow: Shadow; tree: string }> {
+  return exclusive(shadow.scratch, async () => {
+    try {
+      return { shadow, tree: await fingerprintNow($, shadow) }
+    } catch (error) {
+      if (error instanceof ShadowLocked) throw error
+      await resetShadowNow($, shadow)
+      const rebuilt = await openShadowNow($, shadow.root, shadow.scratch)
+      return { shadow: rebuilt, tree: await fingerprintNow($, rebuilt) }
+    }
+  })
+}
+
+async function fingerprintNow($: EngineInterface, shadow: Shadow): Promise<string> {
+  // a second session in this project may hold the index for a moment; a git killed mid-write holds it for good
+  for (let attempt = 1; ; attempt++) {
+    const added = await git($, shadow, ['add', '-A', '--ignore-errors', '--', '.'], { timeoutMs: 180_000, isTolerant: true })
+    if (!added.stderr.includes('index.lock')) break
+    if (attempt === 4) throw new ShadowLocked('the shadow index is locked by another git process (index.lock)')
+    if (!(await removeStaleLock($, shadow))) await $.clock.sleep(250 * 2 ** attempt)
+  }
   const tree = (await git($, shadow, ['write-tree'])).stdout.trim()
   if (!/^[0-9a-f]{40,64}$/.test(tree)) throw new GitError('git write-tree gave no tree')
   return tree
+}
+
+/** Removes the shadow index's lock when no live git can still own it; true when it did. */
+async function removeStaleLock($: EngineInterface, shadow: Shadow): Promise<boolean> {
+  const lock = `${shadow.index}.lock`
+  const stat = await $.fs.stat(lock).catch(() => undefined)
+  if (stat === undefined || (await $.clock.now()) - stat.mtimeMs < STALE_LOCK_MS) return false
+  return (await $.process.run(['rm', '-f', lock])).exitCode === 0
 }
 
 /** The project's HEAD tree, when it has one; the shadow reads it through the alternates. */
@@ -251,7 +309,7 @@ export async function makeSnapshot(
   tree: string,
   runDir: string,
 ): Promise<{ snapshot: string; linked: string[] }> {
-  const snapshot = `${runDir}/snapshot`
+  const snapshot = snapshotOf(runDir)
   const tar = `${runDir}/snapshot.tar`
   await $.fs.write(`${runDir}/tmp/.keep`, '')
   await $.fs.write(`${snapshot}/.stress-scout/.keep`, '')

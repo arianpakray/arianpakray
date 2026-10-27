@@ -69,6 +69,8 @@ type World = {
   submitted: { text: string; context: readonly string[] }[]
   writes: Map<string, string>
   triagePrompts: string[]
+  /** A slash command's hook is running: the host refuses a prompt.submit then, as the real one does. */
+  isInCommand: boolean
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -85,6 +87,7 @@ function world(on: On): World {
     submitted: [],
     writes: new Map(),
     triagePrompts: [],
+    isInCommand: false,
   }
   mock.store(on)
   mock.env(on, { HOME: '/Users/dev', TMPDIR: '/tmp', CLAUDE_CODE_EXECPATH: '/opt/claude/bin/claude' })
@@ -142,6 +145,7 @@ function world(on: On): World {
     return { isShown: true }
   })
   on('prompt.submit', ($, e) => {
+    if (w.isInCommand) throw new Error('prompt.submit: called from a command.run hook, it would wait on the turn this hook is holding')
     w.submitted.push({ text: e.text, context: e.context ?? [] })
     return { text: e.text, context: e.context }
   })
@@ -223,6 +227,7 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   // one press hands it over in full; the band then steps aside
   const band = await $.ui.mount({ plugin: 'stress-scout', surface: 'desktop', component: 'AbovePrompt', props: BAND })
   await band.press({ key: 'apply' })
+  await clock.settle()
   const handed = w.submitted.at(-1)
   expect(handed?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
   expect(handed?.text).toContain('```diff')
@@ -230,6 +235,18 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   expect(handed?.text).toContain('/fix.patch')
   expect(await band.find({ text: /engine band/ })).toBeDefined()
   await band.unmount()
+
+  // /stress apply answers first: its hook holds the turn the handoff would wait on
+  const count = w.submitted.length
+  w.isInCommand = true
+  const applied = await $.command.run(stress('apply 1') as never)
+  w.isInCommand = false
+  expect(applied.text).toBe('Handing finding #1 to Claude.')
+  expect(w.submitted).toHaveLength(count)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(count + 1)
+  expect(w.submitted.at(-1)?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
+  expect((await $.command.run(stress('status') as never)).text).toContain('#1 broke src/cache.ts:LruCache.set: lost 1,214')
 
   // typed by hand (or taken from the Tab suggestion): the details ride along as hidden context, once
   await $.prompt.submit({ text: 'Apply stress-scout fix #1: evict before the await', wait: false, origin: { kind: 'composer' } })
