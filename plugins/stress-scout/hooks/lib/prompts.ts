@@ -178,12 +178,12 @@ export function handoffContext(finding: Finding, now: number, maxPatch = 30_000)
       ? `After the fix (same harness, on the snapshot): ${finding.after} — ${finding.isVerified ? 'verified' : 'NOT verified'}`
       : `After the fix: not measured${finding.isVerified ? '' : ' (fix not verified)'}`,
     `Fix: ${finding.fixSummary}${finding.fixExplanation ? ` — ${finding.fixExplanation}` : ''}`,
-    `Harness: ${finding.snapshot}/.stress-scout/ (rerun from ${finding.snapshot}: ${finding.rerun || 'see the harness files'})`,
+    `Harness, in stress-scout's scratch folder outside this project: ${finding.snapshot}/.stress-scout/ (rerun from ${finding.snapshot}: ${finding.rerun || 'see the harness files'})`,
     `Suggested next step: ${finding.nextStep || '(none)'}`,
     `The patch below was made against a snapshot taken ${ago(now - finding.at)} ago; if the code has changed since, adapt it rather than forcing it.`,
     patch !== ''
-      ? `\`\`\`diff\n${clip(patch, maxPatch)}\n\`\`\`${finding.patchPath ? `\nFull patch: ${finding.patchPath}` : ''}`
+      ? `\`\`\`diff\n${clip(patch, maxPatch)}\n\`\`\`${patch.length > maxPatch && finding.patchPath ? `\nThe patch was cut short here; the full patch: ${finding.patchPath}` : ''}`
       : '(no patch was produced)',
-    'Review the patch, apply it to the real code if it is sound, then rerun the harness against the real code to confirm the fix holds.',
+    "Review the patch and apply it to the real code if it is sound. Then confirm the fix holds against the real code: a check like the harness (or the harness itself), or the project's own tests.",
   ].join('\n')
 }

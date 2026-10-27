@@ -245,7 +245,8 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   expect(handed?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
   expect(handed?.text).toContain('```diff')
   expect(handed?.text).toContain('Before the fix: 1,214/10,000 lost')
-  expect(handed?.text).toContain('/fix.patch')
+  // the whole patch is inline, so the session isn't sent to read it from outside the project
+  expect(handed?.text).not.toContain('/fix.patch')
   expect(await band.find({ text: /engine band/ })).toBeDefined()
   await band.unmount()
 
