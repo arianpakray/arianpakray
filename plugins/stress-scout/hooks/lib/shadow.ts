@@ -262,6 +262,11 @@ async function removeStaleLock($: EngineInterface, shadow: Shadow): Promise<bool
   return (await $.process.run(['rm', '-f', lock])).exitCode === 0
 }
 
+/** Whether the shadow holds `tree`; one remembered from before the shadow was rebuilt is gone. */
+export async function hasTree($: EngineInterface, shadow: Shadow, tree: string): Promise<boolean> {
+  return (await git($, shadow, ['cat-file', '-e', `${tree}^{tree}`], { isTolerant: true })).exitCode === 0
+}
+
 /** The project's HEAD tree, when it has one; the shadow reads it through the alternates. */
 export async function headTree($: EngineInterface, shadow: Shadow): Promise<string> {
   if (!shadow.isProjectGit) return ''

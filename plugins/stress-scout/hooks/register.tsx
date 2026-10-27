@@ -36,6 +36,7 @@ import {
   diffStat,
   diffText,
   fingerprintOrRebuild,
+  hasTree,
   headTree,
   listTree,
   makeSnapshot,
@@ -420,7 +421,9 @@ async function choose(
     .map(([key]) => key)
   const currentHashes = await hashesOf($, c, tree, recentKeys)
 
-  const base = memory.lastTree !== '' ? memory.lastTree : await headTree($, c.shadow)
+  // a shadow rebuilt since the last session (its scratch folder cleaned) no longer holds the tree remembered then
+  const remembered = memory.lastTree !== '' && (await hasTree($, c.shadow, memory.lastTree)) ? memory.lastTree : ''
+  const base = remembered !== '' ? remembered : await headTree($, c.shadow)
   if (base !== '' && base !== tree) {
     const paths = await changedPaths($, c.shadow, base, tree)
     if (paths.length > 0) {

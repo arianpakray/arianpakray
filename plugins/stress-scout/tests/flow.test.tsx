@@ -1,10 +1,17 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { fnv } from '../hooks/lib/util'
+
 const ROOT = '/work/proj'
 const TREE_A = 'a'.repeat(40)
 const TREE_B = 'b'.repeat(40)
 const TREE_C = 'f'.repeat(40)
+const TREE_GONE = '9'.repeat(40)
+
+/** A tool call as the engine makes one; loosely typed, so the test checks the same whatever tools this build declares. */
+const toolCall = ($: { tool: { call: unknown } }, input: Record<string, unknown>): Promise<unknown> =>
+  ($.tool.call as unknown as (input: Record<string, unknown>) => Promise<unknown>)(input)
 const HEAD = 'c'.repeat(40)
 const AFTER = 'd'.repeat(40)
 const BLOB = 'e'.repeat(40)
@@ -71,13 +78,15 @@ type World = {
   triagePrompts: string[]
   /** A slash command's hook is running: the host refuses a prompt.submit then, as the real one does. */
   isInCommand: boolean
+  /** Trees the shadow repository does not hold (it was rebuilt since): git refuses to read them. */
+  missingTrees: Set<string>
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 const line = (event: unknown) => `${JSON.stringify(event)}\n`
 
 /** The machine beneath the plugin: git, files, models and the tester process, all from memory. */
-function world(on: On): World {
+function world(on: On, stored: Readonly<Record<string, unknown>> = {}): World {
   const w: World = {
     tree: TREE_A,
     spawned: [],
@@ -88,8 +97,9 @@ function world(on: On): World {
     writes: new Map(),
     triagePrompts: [],
     isInCommand: false,
+    missingTrees: new Set(),
   }
-  mock.store(on)
+  mock.store(on, stored)
   mock.env(on, { HOME: '/Users/dev', TMPDIR: '/tmp', CLAUDE_CODE_EXECPATH: '/opt/claude/bin/claude' })
   on('session.root', () => ({ value: ROOT }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'make the LRU cache safe under concurrent writers', toolUses: [] }] }) as never)
@@ -104,6 +114,9 @@ function world(on: On): World {
   on('process.run', ($, e) => {
     const argv = e.argv.join(' ')
     const index = e.init?.env?.GIT_INDEX_FILE ?? ''
+    if (e.argv.some(arg => w.missingTrees.has(arg.replace('^{tree}', '')))) {
+      return { value: { exitCode: 128, stdout: '', stderr: 'fatal: bad object', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (argv.includes('rev-parse --path-format')) return ok(`${ROOT}/.git\n`)
     if (argv.includes('rev-parse --verify')) return ok(`${HEAD}\n`)
     if (argv.endsWith('write-tree')) return ok(`${index.endsWith('snapshot.index') ? AFTER : w.tree}\n`)
@@ -174,7 +187,7 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
   expect(w.statuses.at(-1)).toMatch(/watching/)
 
-  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' } as never)
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
   w.tree = TREE_B
   await clock.advance(44_000)
   expect(w.spawned).toHaveLength(0)
@@ -259,14 +272,14 @@ test('memory: the same code is not stress-tested twice', { timeoutMs: 30_000 }, 
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
   const w = world(on)
   await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
-  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' } as never)
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
   w.tree = TREE_B
   await clock.advance(45_000)
   await clock.settle()
   expect(w.spawned).toHaveLength(1)
 
   // another edit elsewhere; the triage picks the same, unchanged file again
-  await $.tool.call({ tool: 'Edit', file_path: `${ROOT}/README.md`, old_string: 'a', new_string: 'b' } as never)
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/README.md`, old_string: 'a', new_string: 'b' })
   w.tree = TREE_C
   await clock.advance(4 * 60_000)
   await clock.settle()
@@ -295,7 +308,7 @@ test('the pane draws on every surface, and Pause stops automatic runs', { timeou
   expect(w.statuses.at(-1)).toMatch(/paused/)
   await pane.unmount()
 
-  await $.tool.call({ tool: 'Write', file_path: `${ROOT}/src/queue.ts`, content: 'x' } as never)
+  await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/queue.ts`, content: 'x' })
   w.tree = TREE_B
   await clock.advance(10 * 60_000)
   await clock.settle()
@@ -337,17 +350,30 @@ test('inside the tester process the mod is the guard alone', { timeoutMs: 30_000
   })
   await $.session.start({ cwd: `${RUN}/snapshot`, surface: null, isInteractive: false })
 
-  const intoProject = await $.tool.call({ tool: 'Write', file_path: `${ROOT}/src/a.ts`, content: 'x' } as never)
+  const intoProject = await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/a.ts`, content: 'x' })
   expect(JSON.stringify(intoProject)).toContain('stress-scout guard')
-  const push = await $.tool.call({ tool: 'Bash', command: 'git push origin main' } as never)
+  const push = await toolCall($, { tool: 'Bash', command: 'git push origin main' })
   expect(JSON.stringify(push)).toContain('git push is not allowed')
-  const secrets = await $.tool.call({ tool: 'Read', file_path: '/Users/dev/.ssh/id_ed25519' } as never)
+  const secrets = await toolCall($, { tool: 'Read', file_path: '/Users/dev/.ssh/id_ed25519' })
   expect(JSON.stringify(secrets)).toContain('secrets')
   expect(ran).toBe(0)
 
-  const harness = await $.tool.call({ tool: 'Write', file_path: `${RUN}/snapshot/.stress-scout/h.py`, content: 'print(1)' } as never)
+  const harness = await toolCall($, { tool: 'Write', file_path: `${RUN}/snapshot/.stress-scout/h.py`, content: 'print(1)' })
   expect(JSON.stringify(harness)).not.toContain('stress-scout guard')
-  const run = await $.tool.call({ tool: 'Bash', command: 'timeout 120 python3 .stress-scout/h.py' } as never)
+  const run = await toolCall($, { tool: 'Bash', command: 'timeout 120 python3 .stress-scout/h.py' })
   expect(JSON.stringify(run)).not.toContain('stress-scout guard')
   expect(ran).toBe(2)
+})
+
+test('a tree remembered from before the scratch folder was cleaned falls back to HEAD, so changes are still caught', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on, { [`mem:${fnv(ROOT)}`]: { v: 1, lastTree: TREE_GONE, lastSweepAt: 0, nextId: 1, touchedAt: 0, tested: {}, dismissed: {} } })
+  w.missingTrees.add(TREE_GONE)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.triagePrompts).toHaveLength(1)
+  expect(w.spawned).toHaveLength(1)
 })
