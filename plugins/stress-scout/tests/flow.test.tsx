@@ -1,4 +1,4 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { fnv } from '../hooks/lib/util'
@@ -125,6 +125,10 @@ type World = {
   runs: (readonly string[])[]
   /** Paths that exist beyond the files the plugin wrote. */
   existing: Set<string>
+  /** The account's usage windows, as the last reply reported them. */
+  rateLimits: { kind: string; percentUsed: number }[]
+  /** The session's credential as `$.session.authorize()` answers it; `refused` makes the call throw. */
+  credential: { handle: string; kind: 'bearer' | 'api-key' } | null | 'refused'
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -145,12 +149,18 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     missingTrees: new Set(),
     runs: [],
     existing: new Set(),
+    rateLimits: [],
+    credential: null,
   }
   mock.store(on, stored)
   mock.env(on, place.env)
   on('session.root', () => ({ value: place.root }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'make the LRU cache safe under concurrent writers', toolUses: [] }] }) as never)
-  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [] } }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: w.rateLimits } }) as never)
+  on('session.authorize', () => {
+    if (w.credential === 'refused') throw new Error('session.authorize: refused')
+    return { value: w.credential }
+  })
   on('fs.write', ($, e) => {
     w.writes.set(fromDrive(e.path), e.text)
     return { value: undefined }
@@ -266,6 +276,7 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   expect(cwd).toMatch(/\/tmp\/stress-scout\/proj-[0-9a-f]{8}\/runs\/run-0001-\d+\/snapshot$/)
   expect(cwd.endsWith(`${slashed(flag('--add-dir') ?? '').replace(/^[A-Za-z]:/, '')}/snapshot`)).toBe(true)
   expect(tester?.env?.STRESS_SCOUT_ROLE).toBe('tester')
+  expect(tester?.env?.ANTHROPIC_API_KEY).toBe(undefined)
   expect(JSON.parse(tester?.env?.STRESS_SCOUT_ROOTS ?? '[]')).toEqual([ROOT])
   expect(tester?.input).toContain('TARGET: src/cache.ts:LruCache.set')
   expect(tester?.input).toContain('REAL PROJECT (off-limits; never touch or name it): /work/proj')
@@ -382,6 +393,48 @@ test('a focused /stress run skips triage and goes straight to the tester', { tim
   expect(w.triagePrompts).toHaveLength(0)
   expect(w.spawned).toHaveLength(1)
   expect(w.spawned[0]?.input).toContain('TARGET: the retry loop in api/client.ts')
+})
+
+describe('the tester bills what the session bills', () => {
+  const cases = [
+    { name: 'on a plan login, a stray ANTHROPIC_API_KEY is blanked for it', credential: { handle: 'h', kind: 'bearer' as const }, key: '' },
+    { name: 'on an API key, it keeps the key the session bills', credential: { handle: 'h', kind: 'api-key' as const }, key: undefined },
+    { name: "where the engine won't say, a plan's usage window tells", credential: 'refused' as const, key: '' },
+  ]
+  for (const { name, credential, key } of cases) {
+    test(name, { timeoutMs: 30_000 }, async ($, on) => {
+      const clock = mock.clock(on, { now: 1_700_000_000_000 })
+      const w = world(on)
+      w.credential = credential
+      w.rateLimits = [{ kind: 'five_hour', percentUsed: 12 }]
+      await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+      await $.command.run(stress('the retry loop in api/client.ts') as never)
+      await clock.settle()
+      expect(w.spawned).toHaveLength(1)
+      expect(w.spawned[0]?.env?.ANTHROPIC_API_KEY).toBe(key)
+    })
+  }
+})
+
+test('automatic runs wait while the weekly window is nearly used, whatever the 5-hour one says', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  w.rateLimits = [{ kind: 'five_hour', percentUsed: 12 }, { kind: 'seven_day', percentUsed: 85 }]
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/queue.ts`, content: 'x' })
+  w.tree = TREE_B
+  await clock.advance(10 * 60_000)
+  await clock.settle()
+  expect(w.triagePrompts).toHaveLength(0)
+  expect(w.spawned).toHaveLength(0)
+  const pane = await $.ui.mount({ plugin: 'stress-scout', surface: 'desktop', component: 'Pane', requestId: 'stress-scout', props: PANE })
+  expect(await pane.find({ text: /skipped, your weekly usage window is at or above 80%/ })).toBeDefined()
+  await pane.unmount()
+
+  // /stress still runs on request
+  await $.command.run(stress('the retry loop in api/client.ts') as never)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
 })
 
 test('inside the tester process the mod is the guard alone', { timeoutMs: 30_000 }, async ($, on) => {

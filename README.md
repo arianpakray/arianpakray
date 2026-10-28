@@ -54,8 +54,9 @@ These are the defaults; change them in `/config` under stress-scout.
 - A Haiku triage gates every automatic run, and the tester runs only when the risk is medium or high.
 - At most 8 automatic runs per session (up to 3 of them idle sweeps), at least 3 minutes apart. `/stress` always works.
 - Each run is capped at $2 (`--max-budget-usd`) and 20 minutes.
-- Automatic runs pause while your 5-hour usage window is at or above 80%.
-- Spend is shown in the pane and in `/stress status`.
+- Automatic runs pause while your 5-hour or weekly usage window is at or above 80%. That keeps them short of your plan's limits, past which extra usage, if you've turned it on, is billed.
+- Spend is shown in the pane and in `/stress status`. On a Claude plan that's what the tokens would cost on the API, not a charge.
+- On a Claude plan, the tester bills the plan too. `claude -p` uses an `ANTHROPIC_API_KEY` it finds in your environment without asking, where an interactive session asks first, so stress-scout blanks that key for the tester.
 
 ## Safety
 
