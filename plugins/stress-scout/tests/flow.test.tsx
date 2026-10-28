@@ -90,6 +90,9 @@ const fromDrive = (path: string): string => path.slice(Math.max(0, path.search(/
 
 const slashed = (path: string): string => path.replace(/\\/g, '/')
 
+/** The kit resolves a path on the machine it runs on: on Windows `/work/proj` reaches a hook as `C:\work\proj`. Read back as written. */
+const posixOf = (path: string): string => slashed(fromDrive(path).replace(/^[A-Za-z]:(?=[\\/])/, ''))
+
 /** A PowerShell -EncodedCommand argument read back: base64 of UTF-16LE. */
 function decodePowerShell(encoded: string): string {
   const digits = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
@@ -154,6 +157,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
   }
   mock.store(on, stored)
   mock.env(on, place.env)
+  const spell = /^[A-Za-z]:/.test(place.root) ? fromDrive : posixOf
   on('session.root', () => ({ value: place.root }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'make the LRU cache safe under concurrent writers', toolUses: [] }] }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: w.rateLimits } }) as never)
@@ -162,11 +166,11 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     return { value: w.credential }
   })
   on('fs.write', ($, e) => {
-    w.writes.set(fromDrive(e.path), e.text)
+    w.writes.set(spell(e.path), e.text)
     return { value: undefined }
   })
-  on('fs.exists', ($, e) => ({ value: w.writes.has(fromDrive(e.path)) || w.existing.has(fromDrive(e.path)) }))
-  on('fs.stat', ($, e) => ({ value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: fromDrive(e.path) } }))
+  on('fs.exists', ($, e) => ({ value: [...w.writes.keys(), ...w.existing].some(path => slashed(path) === slashed(spell(e.path))) }))
+  on('fs.stat', ($, e) => ({ value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: spell(e.path) } }))
   on('fs.list', () => ({ value: [] }))
   on('process.run', ($, e) => {
     w.runs.push(e.argv)
@@ -445,7 +449,7 @@ test('inside the tester process the mod is the guard alone', { timeoutMs: 30_000
     STRESS_SCOUT_RUN_DIRS: JSON.stringify([RUN]),
     STRESS_SCOUT_HOME: '/Users/dev',
   })
-  on('fs.stat', ($, e) => ({ value: { kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }))
+  on('fs.stat', ($, e) => ({ value: { kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false, realPath: posixOf(e.path) } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   let ran = 0
   on('tool.call', () => {
