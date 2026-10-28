@@ -1,0 +1,12 @@
+{
+  "name": "arianpakray",
+  "owner": { "name": "arianpakray" },
+  "description": "Claude Code mods by arianpakray.",
+  "plugins": [
+    {
+      "name": "stress-scout",
+      "source": "./plugins/stress-scout",
+      "description": "Stress-tests your code while you build it, and hands back fixes it has already verified."
+    }
+  ]
+}
