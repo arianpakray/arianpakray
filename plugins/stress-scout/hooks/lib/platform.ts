@@ -97,8 +97,9 @@ export function extendedPath(path: string): string {
  * Remove-Item can walk into a junction and empty its target, which for a
  * snapshot's node_modules is the real project's, so links are unlinked
  * where they stand and only real folders are entered. Plain .NET calls on
- * `\\?\` paths, so deep trees delete too; a file that won't go (one held
- * open) is passed over, and the caller hears whether the tree is gone.
+ * `\\?\` paths where .NET takes them, so deep trees delete too; a file that
+ * won't go (one held open) is passed over, and the caller hears whether the
+ * tree is gone.
  */
 const REMOVE_TREE = `
 function Remove-Tree([string]$Path) {
@@ -116,12 +117,27 @@ function Remove-Tree([string]$Path) {
   } catch { }
 }`
 
+/**
+ * The PowerShell that deletes `path` and exits 1 unless it is gone. .NET's
+ * older path handling, which Windows PowerShell can run with, takes no `\\?\`
+ * path: there every call on one fails, and `Exists` answers false, so the
+ * plain path is used instead. A tree past 260 characters then stays, and is
+ * reported as still there.
+ */
+export function removeTreeScript(path: string): string {
+  return [
+    REMOVE_TREE,
+    `$target = ${psQuote(extendedPath(path))}`,
+    `try { [void][IO.Path]::GetFullPath($target) } catch { $target = ${psQuote(path.replace(/\//g, '\\'))} }`,
+    'Remove-Tree $target',
+    'if ([IO.Directory]::Exists($target) -or [IO.File]::Exists($target)) { exit 1 }',
+  ].join('\n')
+}
+
 /** Deletes a file or a folder tree, never through a link; true when it is gone. */
 export async function removeTree($: EngineInterface, path: string, isWindows: boolean, timeoutMs = 120_000): Promise<boolean> {
   if (!isWindows) return (await $.process.run(['rm', '-rf', path], { timeoutMs })).exitCode === 0
-  const target = psQuote(extendedPath(path))
-  const script = `${REMOVE_TREE}\nRemove-Tree ${target}\nif ([IO.Directory]::Exists(${target}) -or [IO.File]::Exists(${target})) { exit 1 }`
-  return (await powershell($, script, timeoutMs)).exitCode === 0
+  return (await powershell($, removeTreeScript(path), timeoutMs)).exitCode === 0
 }
 
 /** Links folder `link` to `target`: a symbolic link, or on Windows a junction (no admin rights needed). */
