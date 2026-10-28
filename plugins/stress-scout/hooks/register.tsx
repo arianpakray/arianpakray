@@ -35,6 +35,7 @@ import {
   answerText,
   checkPreRegistration,
   checkWeb,
+  sourcesOf,
   fingerprintOf,
   fromLedger,
   ideaQuestion,
@@ -179,6 +180,8 @@ const live = {
   box: undefined as Sandbox | undefined,
   /** inside a discovery tester that may use the web tools */
   hasWeb: false,
+  /** what this discovery tester's searches returned, and how many it made */
+  web: { sources: new Set<string>(), queries: new Set<string>() },
   config: configOf({}),
   ctx: undefined as Ctx | undefined,
   ctxError: '',
@@ -498,7 +501,7 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
       return checkWrite(await placed($, text('notebook_path')), text('new_source'), box)
     case 'WebSearch':
     case 'WebFetch':
-      return live.hasWeb ? checkWeb(tool, input) : refuse(`${tool} is only for a discovery run with fresh sources on`)
+      return live.hasWeb ? checkWeb(tool, input, live.web) : refuse(`${tool} is only for a discovery run with fresh sources on`)
     default:
       return refuse(`${tool} is not part of the tester's toolkit`)
   }
@@ -1678,6 +1681,7 @@ async function onSessionStart($: $): Promise<void> {
   if ((await $.env.get('STRESS_SCOUT_ROLE')) === 'tester') {
     live.role = 'tester'
     live.hasWeb = (await $.env.get('STRESS_SCOUT_WEB')) === '1'
+    live.web = { sources: new Set(), queries: new Set() }
     live.box = await loadSandbox($)
     return
   }
@@ -1750,7 +1754,12 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     if (live.role === 'tester') {
       const check = await testerCheck($, String(e.tool), e as unknown as Record<string, unknown>)
-      return check.isAllowed ? next(e) : { deny: check.reason }
+      if (!check.isAllowed) return { deny: check.reason }
+      if (e.tool !== 'WebSearch') return next(e)
+      live.web.queries.add(String(e.query))
+      const searched = await next(e)
+      for (const source of sourcesOf(searched.result)) live.web.sources.add(source)
+      return searched
     }
     const ran = await next(e)
     if (EDIT_TOOLS.has(String(e.tool)) && ran.deny === undefined && ran.isError !== true) await noteEdit($)

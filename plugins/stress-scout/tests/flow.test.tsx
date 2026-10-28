@@ -1538,15 +1538,28 @@ describe('discovery scout', () => {
       })
       on('fs.stat', ($, e) => ({ value: { kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false, realPath: posixOf(e.path) } }))
       on('session.start', ($, e) => ({ cwd: e.cwd }))
-      on('tool.call', () => ({ result: 'ok' }) as never)
+      on('tool.call', ($, e) =>
+        (e.tool === 'WebSearch'
+          ? { result: { query: '', durationSeconds: 1, results: [{ tool_use_id: 't', content: [{ title: 'lru', url: 'https://example.com/lru/releases#v11' }] }] } }
+          : { result: 'ok' }) as never,
+      )
       await $.session.start({ cwd: `${RUN}/snapshot`, surface: null, isInteractive: false })
     }
 
     test('inside a discovery tester the guard allows public https sources and refuses anything else', { timeoutMs: 30_000 }, async ($, on) => {
       await testerWith($, on, { STRESS_SCOUT_WEB: '1' })
       const refused = async (input: Record<string, unknown>) => JSON.stringify(await toolCall($, input)).includes('stress-scout guard')
-      expect(await refused({ tool: 'WebFetch', url: 'https://example.com/lru/releases' })).toBe(false)
+      // a page is fetched only once a search has returned it
+      expect(await refused({ tool: 'WebFetch', url: 'https://example.com/lru/releases' })).toBe(true)
       expect(await refused({ tool: 'WebSearch', query: 'lru-cache changelog 2026' })).toBe(false)
+      expect(await refused({ tool: 'WebFetch', url: 'https://example.com/lru/releases' })).toBe(false)
+      expect(await refused({ tool: 'WebFetch', url: 'https://example.com/lru/releases/' })).toBe(false)
+      // project text cannot ride out in an address or a query
+      expect(await refused({ tool: 'WebFetch', url: 'https://example.com/lru/releases?q=const%20SECRET%3D1' })).toBe(true)
+      expect(await refused({ tool: 'WebFetch', url: 'https://example.com/c2NyZXQ' })).toBe(true)
+      expect(await refused({ tool: 'WebSearch', query: 'export const cache = new LRU({ max: 10 })' })).toBe(true)
+      expect(await refused({ tool: 'WebSearch', query: `lru ${'Y29uc3QgU0VDUkVUPTE'.repeat(3)}` })).toBe(true)
+      expect(await refused({ tool: 'WebSearch', query: 'lru', allowed_domains: ['src/cache.ts has a bug'] })).toBe(true)
       expect(await refused({ tool: 'WebFetch', url: 'http://example.com/a' })).toBe(true)
       expect(await refused({ tool: 'WebFetch', url: 'https://user:pass@example.com/a' })).toBe(true)
       expect(await refused({ tool: 'WebFetch', url: 'https://localhost/a' })).toBe(true)
@@ -1554,6 +1567,14 @@ describe('discovery scout', () => {
       expect(await refused({ tool: 'WebSearch', query: 'x'.repeat(300) })).toBe(true)
       // the rest of the guard is unchanged
       expect(await refused({ tool: 'Bash', command: 'git push origin main' })).toBe(true)
+    })
+
+    test('a discovery tester searches at most a dozen times', { timeoutMs: 30_000 }, async ($, on) => {
+      await testerWith($, on, { STRESS_SCOUT_WEB: '1' })
+      for (let i = 0; i < 12; i++) expect(JSON.stringify(await toolCall($, { tool: 'WebSearch', query: `lru cache ${i}` }))).not.toContain('stress-scout guard')
+      expect(JSON.stringify(await toolCall($, { tool: 'WebSearch', query: 'lru cache 12' }))).toContain('at most 12 searches')
+      // asking again sends nothing new
+      expect(JSON.stringify(await toolCall($, { tool: 'WebSearch', query: 'lru cache 3' }))).not.toContain('stress-scout guard')
     })
 
     test('inside an ordinary tester the web tools are refused', { timeoutMs: 30_000 }, async ($, on) => {

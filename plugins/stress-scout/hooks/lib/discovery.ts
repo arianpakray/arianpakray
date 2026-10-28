@@ -86,16 +86,48 @@ export function renderLedger(entries: readonly LedgerEntry[]): string {
 export const ideaQuestion = (idea: { title: string; why: string }): string =>
   `Does this pay off in this codebase: ${idea.title}? ${idea.why}`.trim()
 
+/** What a discovery tester may send out, and what it may fetch: the addresses its searches returned. */
+export type WebBudget = { sources: ReadonlySet<string>; queries: ReadonlySet<string> }
+
+export const MAX_SEARCHES = 12
+
+/** An address as the guard compares it: no fragment, no trailing slash. */
+export const sourceKey = (raw: string): string => {
+  try {
+    const url = new URL(raw)
+    url.hash = ''
+    return url.href.replace(/\/$/, '')
+  } catch {
+    return ''
+  }
+}
+
+/** The addresses a WebSearch result lists, as the guard compares them. */
+export function sourcesOf(result: unknown): string[] {
+  const results = (result as { results?: unknown } | null)?.results
+  if (!Array.isArray(results)) return []
+  return results.flatMap(r => {
+    const hits = typeof r === 'object' && r !== null ? (r as { content?: unknown }).content : undefined
+    return Array.isArray(hits) ? hits.map(hit => sourceKey(String((hit as { url?: unknown }).url ?? ''))).filter(key => key !== '') : []
+  })
+}
+
 /**
  * The guard for the web tools of a discovery run. They reach the web through the
- * model provider, not the sandbox, so what could leave in a request is bounded:
- * plain https, no credentials in the address, no private hosts, short queries.
+ * model provider, not the sandbox, so the only free text that leaves is a search:
+ * a few plain words, a dozen different searches a run. A fetch is only of an address a search
+ * returned, so no project text rides out in a path or query string.
  */
-export function checkWeb(tool: string, input: Record<string, unknown>): Check {
+export function checkWeb(tool: string, input: Record<string, unknown>, budget: WebBudget): Check {
   const refuse = (reason: string): Check => ({ isAllowed: false, reason: `stress-scout guard: ${reason}` })
   if (tool === 'WebSearch') {
     const query = typeof input.query === 'string' ? input.query : ''
-    return query.trim() === '' || query.length > 200 ? refuse('a search query is 1 to 200 characters') : { isAllowed: true }
+    if (query.trim() === '' || query.length > 120) return refuse('a search query is 1 to 120 characters')
+    if (!/^[\p{L}\p{N} .,:'"()+\-/?&#@]+$/u.test(query) || /\S{41,}/.test(query)) return refuse('a search query is plain words, never code or encoded text')
+    const domains = [input.allowed_domains, input.blocked_domains].flatMap(list => (Array.isArray(list) ? list : []))
+    if (domains.length > 10 || domains.some(d => typeof d !== 'string' || !/^[a-z0-9.-]{1,63}$/i.test(d))) return refuse('domain filters are a few host names')
+    if (!budget.queries.has(query) && budget.queries.size >= MAX_SEARCHES) return refuse(`a discovery run makes at most ${MAX_SEARCHES} searches`)
+    return { isAllowed: true }
   }
   const raw = typeof input.url === 'string' ? input.url : ''
   let url: URL
@@ -110,5 +142,6 @@ export function checkWeb(tool: string, input: Record<string, unknown>): Check {
   if (/^(localhost|.*\.local|.*\.internal)$/i.test(url.hostname) || /^[\d.]+$/.test(url.hostname) || url.hostname.includes(':')) {
     return refuse('only public host names are fetched')
   }
+  if (!budget.sources.has(sourceKey(raw))) return refuse('only an address a search returned is fetched; search for the page first')
   return { isAllowed: true }
 }
