@@ -22,7 +22,7 @@ export type Finding = {
   rerun: string
   snapshot: string
   confidence: string
-  status: 'new' | 'applied' | 'dismissed'
+  status: 'new' | 'handing' | 'applied' | 'dismissed'
   durationMs: number
   tokens: number
   cost: number

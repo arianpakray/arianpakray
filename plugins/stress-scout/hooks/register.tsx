@@ -861,6 +861,7 @@ async function autoApply($: $, id: number): Promise<void> {
   if (finding === undefined || finding.status !== 'new') return
   await log($, `#${id}: verified fix handed to Claude automatically`)
   $.ui.toast(`stress-scout is handing verified fix #${id} to Claude`, { timeoutMs: 8000 })
+  await setStatus($, id, 'handing')
   await handOff($, finding)
 }
 
@@ -1017,23 +1018,32 @@ async function apply($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
   if (finding === undefined) return `No finding #${id}.`
   if (finding.patch === '' && finding.nextStep === '') return `Finding #${id} has no fix to hand over.`
+  if (finding.status === 'handing' || finding.status === 'applied') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
+  // marked before the handoff is scheduled: the prompt only resolves once Claude is free, and repeat presses must not queue copies
+  await setStatus($, id, 'handing')
   // /stress apply's hook holds the turn a submitted prompt waits on: hand over once the command has answered
   $.clock.after(0, () => void handOff($, finding))
   return `Handing finding #${id} to Claude.`
 }
 
-/** Submits the handoff as the person's prompt; the finding counts as applied once it entered. */
+const setStatus = async ($: $, id: number, status: Finding['status']): Promise<void> => {
+  await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status } : f)))
+}
+
+/** Submits the handoff as the person's prompt; the finding counts as applied once it entered, and is applicable again if it did not. */
 async function handOff($: $, finding: Finding): Promise<void> {
   try {
     const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now()), asUser: true })
     if (entered.drop !== undefined) {
       await log($, `#${finding.id} was not handed over: ${entered.drop}`)
+      await setStatus($, finding.id, 'new')
       return
     }
-    await update($, findingsAtom, list => list.map(f => (f.id === finding.id ? { ...f, status: 'applied' as const } : f)))
+    await setStatus($, finding.id, 'applied')
     await update($, seenAtom, seen => Math.max(seen, finding.id))
   } catch (error) {
     await log($, `#${finding.id} was not handed over: ${messageOf(error)}`)
+    await setStatus($, finding.id, 'new')
     $.ui.toast(`stress-scout could not hand #${finding.id} to Claude: ${clip(messageOf(error), 120)}`, { timeoutMs: 8000 })
   }
 }
@@ -1200,6 +1210,12 @@ async function onSessionStart($: $): Promise<void> {
   if (stale !== null) {
     // the tester process ended with the module it belonged to
     await finishRun($, stale, { answer: '', cost: 0, tokens: 0, failure: 'interrupted: stress-scout reloaded while it ran', steps: 0 })
+  }
+  // a handoff awaited by the module before this one never reports back: let the person press Apply again
+  const stuck = (await read($, findingsAtom)).filter(f => f.status === 'handing')
+  for (const f of stuck) {
+    await log($, `#${f.id}: stress-scout reloaded mid-handoff; Apply is offered again (check the prompt did not already go in)`)
+    await setStatus($, f.id, 'new')
   }
   live.watchTimer?.cancel()
   live.watchTimer = $.clock.every(60_000, () => void heartbeat($))

@@ -138,6 +138,10 @@ type World = {
   surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
+  /** While set, prompt.submit does not resolve: Claude is busy and the prompt waits its turn. */
+  submitGate: Promise<void> | undefined
+  /** How the next prompt.submit calls fail, one entry each: a throw, or a drop. */
+  submitFailures: ('throw' | 'drop')[]
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -152,6 +156,8 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     toasts: [],
     suggestions: [],
     submitted: [],
+    submitGate: undefined,
+    submitFailures: [],
     writes: new Map(),
     triagePrompts: [],
     isInCommand: false,
@@ -232,9 +238,13 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     w.suggestions.push(e.text)
     return { isShown: true }
   })
-  on('prompt.submit', ($, e) => {
+  on('prompt.submit', async ($, e) => {
     if (w.isInCommand) throw new Error('prompt.submit: called from a command.run hook, it would wait on the turn this hook is holding')
     w.submitted.push({ text: e.text, context: e.context ?? [] })
+    await w.submitGate
+    const failure = w.submitFailures.shift()
+    if (failure === 'throw') throw new Error('session closed')
+    if (failure === 'drop') return { drop: 'busy' } as never
     return { text: e.text, context: e.context }
   })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -338,16 +348,12 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   expect(await band.find({ text: /engine band/ })).toBeDefined()
   await band.unmount()
 
-  // /stress apply answers first: its hook holds the turn the handoff would wait on
+  // handed over already: /stress apply says so and sends nothing more
   const count = w.submitted.length
-  w.isInCommand = true
   const applied = await $.command.run(stress('apply 1') as never)
-  w.isInCommand = false
-  expect(applied.text).toBe('Handing finding #1 to Claude.')
-  expect(w.submitted).toHaveLength(count)
+  expect(applied.text).toBe('Finding #1 is already handed to Claude.')
   await clock.settle()
-  expect(w.submitted).toHaveLength(count + 1)
-  expect(w.submitted.at(-1)?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
+  expect(w.submitted).toHaveLength(count)
   expect((await $.command.run(stress('status') as never)).text).toContain('#1 broke src/cache.ts:LruCache.set: lost 1,214')
 
   // typed by hand (or taken from the Tab suggestion): the details ride along as hidden context, once
@@ -547,6 +553,79 @@ test('by default, a verified fix goes to Claude once the session sits idle', { t
   await clock.advance(5 * 60_000)
   await clock.settle()
   expect(w.submitted).toHaveLength(1)
+})
+
+/** A verified fix waiting for a tap (autoApplyVerifiedFixes off). */
+async function verifiedFix($: Parameters<NonNullable<Parameters<typeof test>[2]>>[0], on: On) {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  return { clock, w }
+}
+
+test('pressing Apply again while Claude is busy does not queue the prompt twice', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { clock, w } = await verifiedFix($, on)
+  let release = () => {}
+  w.submitGate = new Promise<void>(resolve => (release = resolve))
+
+  const band = await $.ui.mount({ plugin: 'stress-scout', surface: 'desktop', component: 'AbovePrompt', props: BAND })
+  await band.press({ key: 'apply' })
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+  // the submit is still pending: the finding is mid-handoff, so no button and no second copy
+  expect(await band.find({ key: 'apply' })).toBeUndefined()
+  await band.unmount()
+  for (let i = 0; i < 3; i++) {
+    const again = await $.command.run(stress('apply 1') as never)
+    expect(again.text).toBe('Finding #1 is already being handed to Claude.')
+  }
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+  expect((await $.command.run(stress('status') as never)).text).toContain('[handing]')
+
+  release()
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+  expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
+})
+
+test('a finding left mid-handoff by a reload can be applied again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { clock, w } = await verifiedFix($, on)
+  let release = () => {}
+  w.submitGate = new Promise<void>(resolve => (release = resolve))
+  expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+  await clock.settle()
+  expect((await $.command.run(stress('status') as never)).text).toContain('[handing]')
+
+  // a reload runs session.start again; the old module's await never comes back
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect((await $.command.run(stress('status') as never)).text).not.toContain('[handing]')
+  expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+  release()
+  await clock.settle()
+})
+
+test('a handoff that fails leaves the finding ready to apply again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { clock, w } = await verifiedFix($, on)
+  w.submitFailures.push('throw', 'drop')
+
+  for (const attempt of [1, 2]) {
+    const result = await $.command.run(stress('apply 1') as never)
+    expect(result.text).toBe('Handing finding #1 to Claude.')
+    await clock.settle()
+    expect(w.submitted).toHaveLength(attempt)
+    expect((await $.command.run(stress('status') as never)).text).not.toMatch(/\[(handing|applied)\]/)
+  }
+
+  expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+  await clock.settle()
+  expect(w.submitted).toHaveLength(3)
+  expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
 })
 
 describe('the tester bills what the session bills', () => {
