@@ -6,6 +6,7 @@
  * but a shell string can always be obfuscated. For OS-level isolation turn on
  * Claude Code's sandbox (/sandbox) as well.
  */
+import { isWindowsPath, windowsCanonical, windowsCanonicalText } from './platform'
 import { DEP_DIRS, snapshotOf } from './shadow'
 import { basename, isInside, normalizePath, trimSlash } from './util'
 
@@ -22,6 +23,18 @@ export type Check = { isAllowed: true } | { isAllowed: false; reason: string }
 
 const OK: Check = { isAllowed: true }
 const deny = (reason: string): Check => ({ isAllowed: false, reason: `stress-scout guard: ${reason}` })
+
+/** The sandbox as the checks compare it: on Windows every path in one spelling (windowsCanonical). */
+type Box = { roots: string[]; runDirs: string[]; home: string; isWindows: boolean; given: Sandbox }
+
+const boxOf = (given: Sandbox): Box => {
+  const isWindows = [...given.roots, ...given.runDirs].some(isWindowsPath)
+  const spell = (path: string): string => (isWindows ? windowsCanonical(path) : path)
+  return { roots: given.roots.map(spell), runDirs: given.runDirs.map(spell), home: given.home === '' ? '' : spell(given.home), isWindows, given }
+}
+
+/** `path` the way the checks compare it. */
+const spelled = (path: string, box: Box): string => (box.isWindows ? windowsCanonical(path) : path)
 
 const LINK_CLIMB =
   "a path that runs through node_modules, .venv or another dependency folder and back up with .. lands in the real project (they are links to it); name the snapshot's files directly"
@@ -41,6 +54,13 @@ const SECRET_HOME_PATHS = [
   '.npmrc',
   '.pypirc',
   '.git-credentials',
+  // where Windows keeps the same kinds of secrets
+  '_netrc',
+  'AppData/Roaming/GitHub CLI',
+  'AppData/Roaming/gcloud',
+  'AppData/Roaming/Microsoft/Credentials',
+  'AppData/Local/Microsoft/Credentials',
+  'AppData/Roaming/Microsoft/Protect',
 ]
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '::1'])
@@ -116,6 +136,7 @@ const INTERPRETERS = new Set([
   'dash',
   'python',
   'python3',
+  'py',
   'node',
   'deno',
   'bun',
@@ -181,8 +202,8 @@ function names(word: string, path: string): boolean {
   return pattern.length >= target.length && target.every((part, i) => segmentMatches(pattern[i] ?? '', part))
 }
 
-/** `~`, `~user`, `$HOME` or `${HOME}` opening a path word, as the shell expands them. */
-const HOME_WORD = /^(~[A-Za-z0-9._-]*|\$HOME|\$\{HOME\})(?=\/|$)/
+/** `~`, `~user`, `$HOME` or `${HOME}` (on Windows also `$USERPROFILE`) opening a path word, as the shell expands them. */
+const HOME_WORD = /^(~[A-Za-z0-9._-]*|\$HOME|\$\{HOME\}|\$USERPROFILE|\$\{USERPROFILE\})(?=[\\/]|$)/
 
 /** `word` with an opening spelling of the person's home written out; another user's `~name` stays. */
 function expandHome(word: string, home: string): string {
@@ -197,20 +218,27 @@ function expandHome(word: string, home: string): string {
  * quoted path keeps its spaces, a brace list its commas), and the raw text's
  * words, which find paths inside code.
  */
-function wordsOf(text: string): string[] {
+function wordsOf(text: string, isWindows = false): string[] {
   const words = new Set<string>()
   for (const segment of splitCommands(text)) {
     for (const token of tokenize(segment)) {
       if (!token.isOp) for (const piece of token.text.split(/[;&|()<>`='"]+/)) words.add(piece.trim())
     }
   }
-  for (const piece of text.split(/[\s;&|()<>`=,'"\\]+/)) words.add(piece)
+  // on Windows a backslash separates a path, so there it splits nothing
+  const raw = isWindows ? text.replace(/\\/g, '/') : text
+  for (const piece of raw.split(isWindows ? /[\s;&|()<>`=,'"]+/ : /[\s;&|()<>`=,'"\\]+/)) words.add(piece)
   words.delete('')
   return [...words]
 }
 
-const pathsOf = (words: readonly string[], home: string): string[] =>
-  words.filter(word => word.includes('/') || HOME_WORD.test(word)).map(word => normalizePath(expandHome(word, home)))
+const pathsOf = (words: readonly string[], home: string, isWindows = false): string[] =>
+  words
+    .filter(word => word.includes('/') || HOME_WORD.test(word) || (isWindows && (word.includes('\\') || /^[A-Za-z]:/.test(word))))
+    .map(word => {
+      const expanded = expandHome(word, home)
+      return normalizePath(isWindows ? windowsCanonical(expanded) : expanded)
+    })
 
 /**
  * The path-like words of `text` as the OS would read them: quoting undone,
@@ -260,9 +288,10 @@ const climbsLink = (word: string): boolean => {
  * of the snapshot's dependency folders, which are links into the real
  * project. Any `..` is refused: past a link it climbs the real project.
  */
-const isUnderRun = (path: string, box: Sandbox): boolean => {
-  if (path.split('/').includes('..')) return false
-  const landing = normalizePath(path)
+const isUnderRun = (path: string, box: Box): boolean => {
+  const given = spelled(path, box)
+  if (given.split('/').includes('..')) return false
+  const landing = normalizePath(given)
   return (
     box.runDirs.some(dir => isInside(landing, dir)) &&
     !box.runDirs.some(dir => DEP_DIRS.some(dep => names(landing, `${snapshotOf(dir)}/${dep}`)))
@@ -270,10 +299,12 @@ const isUnderRun = (path: string, box: Sandbox): boolean => {
 }
 
 /** Reads: anywhere but secrets. `realPath` is where the path lands once links resolve, when known. */
-export function checkRead(path: string, box: Sandbox, realPath?: string): Check {
-  if (climbsLink(path)) return deny(LINK_CLIMB)
-  const given = normalizePath(expandHome(path, box.home))
-  const isSecret = isSecretPath(given, box.home) || (realPath !== undefined && isSecretPath(realPath, box.home))
+export function checkRead(path: string, sandbox: Sandbox, realPath?: string): Check {
+  const box = boxOf(sandbox)
+  if (climbsLink(spelled(path, box))) return deny(LINK_CLIMB)
+  const given = normalizePath(spelled(expandHome(path, box.home), box))
+  const real = realPath === undefined ? undefined : spelled(realPath, box)
+  const isSecret = isSecretPath(given, box.home) || (real !== undefined && isSecretPath(real, box.home))
   return isSecret ? deny('secrets and credentials are off-limits to the tester') : OK
 }
 
@@ -281,13 +312,15 @@ export function checkRead(path: string, box: Sandbox, realPath?: string): Check 
  * Writes and edits: only inside the run folder (`realPath` is where the path
  * lands, resolved by the caller), and no harness that names the real project.
  */
-export function checkWrite(realPath: string | undefined, content: string, box: Sandbox): Check {
+export function checkWrite(realPath: string | undefined, content: string, sandbox: Sandbox): Check {
   if (realPath === undefined) return deny('could not resolve where this file would land')
+  const box = boxOf(sandbox)
   if (!isUnderRun(realPath, box)) {
-    return deny(`files may only be created or changed inside the run folder ${box.runDirs[0] ?? ''}, outside its linked dependency folders`)
+    return deny(`files may only be created or changed inside the run folder ${sandbox.runDirs[0] ?? ''}, outside its linked dependency folders`)
   }
-  const view = pathView(content, box.home)
-  if (box.roots.some(root => mentions(content, root) || view.some(word => names(word, root)))) {
+  const text = box.isWindows ? windowsCanonicalText(content) : content
+  const view = pathsOf(wordsOf(content, box.isWindows), box.home, box.isWindows)
+  if (box.roots.some(root => mentions(text, root) || view.some(word => names(word, root)))) {
     return deny('the harness must not reference the real project; use paths inside the snapshot')
   }
   return OK
@@ -391,7 +424,8 @@ export function tokenize(segment: string): Token[] {
     const char = segment[i] ?? ''
     if (quote) {
       if (char === quote) quote = null
-      else if (char === '\\' && quote === '"' && i + 1 < segment.length) current += segment[++i]
+      // inside double quotes a backslash escapes only $ ` " \ and a newline, as in bash: `"C:\Users"` keeps its
+      else if (char === '\\' && quote === '"' && '$`"\\\n'.includes(segment[i + 1] ?? 'x')) current += segment[++i]
       else current += char
       continue
     }
@@ -451,7 +485,7 @@ export function commandOf(tokens: readonly Token[]): { word: string; args: strin
       i++
       continue
     }
-    const name = basename(word)
+    const name = basename(word).replace(/\.(exe|cmd|bat|com)$/i, '').toLowerCase()
     if (PREFIX_WORDS.has(name)) {
       i++
       while (i < words.length && /^(-|\d+$)/.test(words[i] ?? '')) i++
@@ -500,9 +534,14 @@ export function stripDataHeredocs(command: string): string {
  */
 type Cwd = { path?: string; depth: number }
 
-/** Write targets that are no file: standard streams, /dev/null, file descriptors. */
-const isStream = (target: string): boolean =>
-  target === '' || target === '-' || target.startsWith('&') || /^\d+$/.test(target) || /^\/dev\/(null|stdout|stderr|tty|fd\/\d+)$/.test(target)
+/** Write targets that are no file: standard streams, /dev/null (NUL on Windows), file descriptors. */
+const isStream = (target: string, isWindows: boolean): boolean =>
+  target === '' ||
+  target === '-' ||
+  target.startsWith('&') ||
+  /^\d+$/.test(target) ||
+  /^\/dev\/(null|stdout|stderr|tty|fd\/\d+)$/.test(target) ||
+  (isWindows && /^nul$/i.test(target))
 
 /**
  * Where `target` lands from `cwd`, or undefined when it may leave the run
@@ -510,8 +549,11 @@ const isStream = (target: string): boolean =>
  * out of folders this command entered; after a name it could climb out of
  * one of the snapshot's dependency links, from the real project's side.
  */
-function landing(target: string, cwd: Cwd, box: Sandbox): Cwd | undefined {
+function landing(given: string, cwd: Cwd, box: Box): Cwd | undefined {
+  const target = spelled(given, box)
   if (target.startsWith('~') || target.startsWith('$')) return undefined
+  // `C:x` is relative to whatever folder drive C: was last in
+  if (box.isWindows && /^[a-z]:/.test(target)) return undefined
   const isAbsolute = target.startsWith('/')
   const parts = target.split('/').filter(part => part !== '' && part !== '.')
   let up = 0
@@ -535,16 +577,46 @@ const shown = (path: string): string =>
     ? `${path}; node_modules, .venv and the snapshot's other dependency folders are links into the real project`
     : path
 
-const installTargetOk = (segment: string, flags: RegExp, box: Sandbox, into = ''): boolean => {
+const installTargetOk = (segment: string, flags: RegExp, box: Box, into = ''): boolean => {
   for (const match of segment.matchAll(flags)) {
-    const path = (match[2] ?? '').replace(/^["']|["']$/g, '')
+    const path = spelled((match[2] ?? '').replace(/^["']|["']$/g, ''), box)
     if (path !== '' && path.startsWith('/') && isUnderRun(`${trimSlash(path)}${into}`, box)) return true
   }
   return false
 }
 
+/** Windows shells and system tools: the tester's Bash tool is Git Bash, and these reach past it. */
+const WINDOWS_TOOLS = new Set([
+  'cmd',
+  'powershell',
+  'pwsh',
+  'wsl',
+  'start',
+  'runas',
+  'reg',
+  'regedit',
+  'schtasks',
+  'sc',
+  'net',
+  'netsh',
+  'icacls',
+  'takeown',
+  'setx',
+  'bcdedit',
+  'wmic',
+  'mklink',
+  'cscript',
+  'wscript',
+  'mshta',
+  'rundll32',
+])
+
 /** Shell commands: the checks above, applied to what the command runs and writes. */
-export function checkBash(command: string, box: Sandbox, depth = 0): Check {
+export function checkBash(command: string, sandbox: Sandbox, depth = 0): Check {
+  return bashCheck(command, boxOf(sandbox), depth)
+}
+
+function bashCheck(command: string, box: Box, depth: number): Check {
   if (depth > 3) return deny('command nests too deeply to check')
   const text = stripDataHeredocs(command)
   const word = '(?:^|[\\s;&|(`])'
@@ -556,8 +628,8 @@ export function checkBash(command: string, box: Sandbox, depth = 0): Check {
   if (/:\(\)\s*\{/.test(text) || /\bkill\s+(-\S+\s+)*-1\b/.test(text) || /\bdd\b[^;&|]*\bof=\/dev\//.test(text)) {
     return deny('that command could take down the machine')
   }
-  const words = wordsOf(text)
-  const paths = pathsOf(words, box.home)
+  const words = wordsOf(text, box.isWindows)
+  const paths = pathsOf(words, box.home, box.isWindows)
   const isEnvDump =
     /(^|[\s;&|(`])printenv\b/m.test(text) ||
     /(^|[;&|(`]\s*)export\s+-p\b/m.test(text) ||
@@ -565,10 +637,13 @@ export function checkBash(command: string, box: Sandbox, depth = 0): Check {
     paths.some(path => /^\/proc\/[^/]+\/environ$/i.test(path))
   if (isEnvDump) return deny('do not dump environment variables; they may hold secrets')
 
-  const homes = [box.home, '~', '$HOME', '${HOME}'].filter(home => home !== '')
+  const homes = [box.home, '~', '$HOME', '${HOME}', ...(box.isWindows ? ['$USERPROFILE', '${USERPROFILE}'] : [])].filter(
+    home => home !== '',
+  )
+  const view = box.isWindows ? windowsCanonicalText(text) : text
   // key files are refused wherever they may lie outside the run folder; the harness may make its own test keys
   const isSecret =
-    homes.some(home => SECRET_HOME_PATHS.some(secret => text.includes(`${trimSlash(home)}/${secret}`))) ||
+    homes.some(home => SECRET_HOME_PATHS.some(secret => mentions(view, `${trimSlash(home)}/${secret}`))) ||
     paths.some(path => namesHomeSecret(path, box.home) || (leavesCwd(path) && !isUnderRun(path, box) && isSecretName(basename(path))))
   if (isSecret) return deny('secrets and credentials are off-limits to the tester')
   // .env however the shell is made to spell it: `.env*`, `.e""nv`, `.ENV`
@@ -576,7 +651,7 @@ export function checkBash(command: string, box: Sandbox, depth = 0): Check {
     /(^|[\s'"=/<])\.env(\.(?!example|sample|template|dist)[A-Za-z0-9_-]+)?(?=$|[\s'";|&)<>])/im.test(text) ||
     words.some(word => isEnvGlob(word) || isEnvName(basename(word)))
   if (isEnv) return deny('.env files may hold secrets; use a fake config in the harness')
-  if (words.some(climbsLink)) return deny(LINK_CLIMB)
+  if (words.some(word => climbsLink(spelled(word, box)))) return deny(LINK_CLIMB)
 
   for (const match of text.matchAll(/\b(?:https?|wss?|ftp):\/\/(\[[^\]\s]+\]|[^/\s:'"`)]+)/gi)) {
     const host = (match[1] ?? '').toLowerCase()
@@ -591,6 +666,9 @@ export function checkBash(command: string, box: Sandbox, depth = 0): Check {
   for (const { text: segment, then } of segmentsOf(text)) {
     const tokens = tokenize(segment)
     const { word: name, args } = commandOf(tokens)
+    if (box.isWindows && WINDOWS_TOOLS.has(name)) {
+      return deny(`${name} is not allowed: Windows shells and system tools reach past the sandbox; use bash commands`)
+    }
 
     const inner =
       /^(sh|bash|zsh|dash)$/.test(name) && args.includes('-c')
@@ -599,7 +677,7 @@ export function checkBash(command: string, box: Sandbox, depth = 0): Check {
           ? args.join(' ')
           : undefined
     if (inner !== undefined) {
-      const nested = checkBash(inner, box, depth + 1)
+      const nested = bashCheck(inner, box, depth + 1)
       if (!nested.isAllowed) return nested
     }
 
@@ -612,33 +690,37 @@ export function checkBash(command: string, box: Sandbox, depth = 0): Check {
       /^(npm|pnpm|bun)$/.test(name) && /^(i|install|add|ci)$/.test(args.find(arg => !arg.startsWith('-')) ?? '')
     const isYarnAdd = name === 'yarn' && /^(add|install)$/.test(args[0] ?? '')
     if ((isNodeInstall || isYarnAdd) && !installTargetOk(segment, /(--prefix|--dir|--cwd|-C)[ =]+("?[^\s"]+"?)/g, box, '/node_modules')) {
-      return deny(`install packages only into the run folder, e.g. npm i --prefix ${box.runDirs[0] ?? '<run>'}/deps <pkg>`)
+      return deny(`install packages only into the run folder, e.g. npm i --prefix ${box.given.runDirs[0] ?? '<run>'}/deps <pkg>`)
     }
     const isPip =
       /^pip[0-9.]*$/.test(name) ||
       ((name === 'uv' || /^python[0-9.]*$/.test(name)) && args.includes('pip'))
     if (isPip && args.includes('install')) {
-      const pipInRun = tokens.some(token => !token.isOp && token.text.startsWith('/') && isUnderRun(token.text, box) && /pip[0-9.]*$/.test(token.text))
+      const pipInRun = tokens.some(token => {
+        const path = spelled(token.text, box)
+        return !token.isOp && path.startsWith('/') && isUnderRun(path, box) && /pip[0-9.]*(\.exe)?$/i.test(path)
+      })
       if (!pipInRun && !installTargetOk(segment, /(--target|-t|--prefix)[ =]+("?[^\s"]+"?)/g, box)) {
-        return deny(`install packages only into the run folder, e.g. pip install --target ${box.runDirs[0] ?? '<run>'}/deps <pkg>`)
+        return deny(`install packages only into the run folder, e.g. pip install --target ${box.given.runDirs[0] ?? '<run>'}/deps <pkg>`)
       }
     }
     if (/^(gem|cargo|go|brew|apt|apt-get|yum|dnf|pacman|apk|port|pipx|poetry|pipenv|conda|mamba)$/.test(name) && /^(install|add|get)$/.test(args[0] ?? '')) {
       return deny(`${name} ${args[0] ?? ''} installs globally; use the standard library or install into the run folder`)
     }
 
-    const view = pathView(segment, box.home)
-    if (box.roots.some(root => mentions(segment, root) || view.some(path => names(path, root)))) {
+    const segmentView = box.isWindows ? windowsCanonicalText(segment) : segment
+    const segmentPaths = pathsOf(wordsOf(segment, box.isWindows), box.home, box.isWindows)
+    if (box.roots.some(root => mentions(segmentView, root) || segmentPaths.some(path => names(path, root)))) {
       const isReadOnly =
         READ_ONLY_COMMANDS.has(name) &&
         !/\s-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/.test(segment) &&
         !tokens.some(token => token.isOp && token.text.includes('>'))
       if (!isReadOnly) {
-        return deny(`the real project (${box.roots[0] ?? ''}) is read-only for the tester; work in the snapshot`)
+        return deny(`the real project (${box.given.roots[0] ?? ''}) is read-only for the tester; work in the snapshot`)
       }
     }
 
-    const lands = (target: string): Cwd | undefined => (isStream(target) ? cwd : landing(target, cwd, box))
+    const lands = (target: string): Cwd | undefined => (isStream(target, box.isWindows) ? cwd : landing(target, cwd, box))
     for (let i = 0; i < tokens.length; i++) {
       const token = tokens[i]
       if (!token?.isOp || !token.text.includes('>') || token.text.endsWith('&')) continue

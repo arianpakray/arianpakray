@@ -65,6 +65,47 @@ const PANE = {
 const SURFACES = ['terminal', 'desktop', 'mobile'] as const
 const RUN = '/tmp/stress-scout/proj-1234abcd/runs/run-0001-1700000000000'
 
+/** Where the world runs: the project's root and the environment it starts in. */
+type Place = { root: string; env: Readonly<Record<string, string>> }
+
+const POSIX: Place = { root: ROOT, env: { HOME: '/Users/dev', TMPDIR: '/tmp', CLAUDE_CODE_EXECPATH: '/opt/claude/bin/claude' } }
+
+// Windows as Claude Code started from PowerShell sees it: no HOME, and a Git Bash TMPDIR it must not use
+const WIN_ROOT = 'C:\\work\\proj'
+const WINDOWS: Place = {
+  root: WIN_ROOT,
+  env: {
+    USERPROFILE: 'C:\\Users\\dev',
+    TEMP: 'C:\\Users\\dev\\AppData\\Local\\Temp',
+    TMPDIR: '/tmp',
+    CLAUDE_CODE_EXECPATH: 'C:\\Program Files\\claude\\claude.exe',
+  },
+}
+
+/**
+ * A path as a Windows engine answers it: the kit runs on Linux, where `C:\\...`
+ * is relative, and resolves it against its own folder first. POSIX paths pass.
+ */
+const fromDrive = (path: string): string => path.slice(Math.max(0, path.search(/[A-Za-z]:[\\\\/]/)))
+
+const slashed = (path: string): string => path.replace(/\\/g, '/')
+
+/** A PowerShell -EncodedCommand argument read back: base64 of UTF-16LE. */
+function decodePowerShell(encoded: string): string {
+  const digits = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const bytes: number[] = []
+  for (let i = 0; i < encoded.length; i += 4) {
+    const [a, b, c, d] = [0, 1, 2, 3].map(k => digits.indexOf(encoded[i + k] ?? '='))
+    const n = ((a ?? 0) << 18) | ((b ?? 0) << 12) | (Math.max(c ?? 0, 0) << 6) | Math.max(d ?? 0, 0)
+    bytes.push((n >> 16) & 255)
+    if ((c ?? -1) >= 0) bytes.push((n >> 8) & 255)
+    if ((d ?? -1) >= 0) bytes.push(n & 255)
+  }
+  let text = ''
+  for (let i = 0; i + 1 < bytes.length; i += 2) text += String.fromCharCode((bytes[i] ?? 0) | ((bytes[i + 1] ?? 0) << 8))
+  return text
+}
+
 type Spawned = { argv: readonly string[]; cwd?: string; env?: Readonly<Record<string, string>>; input?: string }
 
 type World = {
@@ -80,13 +121,17 @@ type World = {
   isInCommand: boolean
   /** Trees the shadow repository does not hold (it was rebuilt since): git refuses to read them. */
   missingTrees: Set<string>
+  /** Every command the plugin ran, as its argument vector. */
+  runs: (readonly string[])[]
+  /** Paths that exist beyond the files the plugin wrote. */
+  existing: Set<string>
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
 const line = (event: unknown) => `${JSON.stringify(event)}\n`
 
 /** The machine beneath the plugin: git, files, models and the tester process, all from memory. */
-function world(on: On, stored: Readonly<Record<string, unknown>> = {}): World {
+function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Place = POSIX): World {
   const w: World = {
     tree: TREE_A,
     spawned: [],
@@ -98,20 +143,23 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}): World {
     triagePrompts: [],
     isInCommand: false,
     missingTrees: new Set(),
+    runs: [],
+    existing: new Set(),
   }
   mock.store(on, stored)
-  mock.env(on, { HOME: '/Users/dev', TMPDIR: '/tmp', CLAUDE_CODE_EXECPATH: '/opt/claude/bin/claude' })
-  on('session.root', () => ({ value: ROOT }))
+  mock.env(on, place.env)
+  on('session.root', () => ({ value: place.root }))
   on('session.messages', () => ({ value: [{ role: 'user', text: 'make the LRU cache safe under concurrent writers', toolUses: [] }] }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, context: {}, rateLimits: [] } }) as never)
   on('fs.write', ($, e) => {
-    w.writes.set(e.path, e.text)
+    w.writes.set(fromDrive(e.path), e.text)
     return { value: undefined }
   })
-  on('fs.exists', ($, e) => ({ value: w.writes.has(e.path) }))
-  on('fs.stat', ($, e) => ({ value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }))
+  on('fs.exists', ($, e) => ({ value: w.writes.has(fromDrive(e.path)) || w.existing.has(fromDrive(e.path)) }))
+  on('fs.stat', ($, e) => ({ value: { kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false, realPath: fromDrive(e.path) } }))
   on('fs.list', () => ({ value: [] }))
   on('process.run', ($, e) => {
+    w.runs.push(e.argv)
     const argv = e.argv.join(' ')
     const index = e.init?.env?.GIT_INDEX_FILE ?? ''
     if (e.argv.some(arg => w.missingTrees.has(arg.replace('^{tree}', '')))) {
@@ -213,8 +261,10 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   expect(argv).toContain('--strict-mcp-config')
   expect(argv).toContain('--no-session-persistence')
   expect(flag('--plugin-dir')).toBeDefined()
-  expect(tester?.cwd).toMatch(/^\/tmp\/stress-scout\/proj-[0-9a-f]{8}\/runs\/run-0001-\d+\/snapshot$/)
-  expect(flag('--add-dir')).toBe(tester?.cwd?.replace(/\/snapshot$/, ''))
+  // compared with forward slashes, from the end: a Windows host spells /tmp as D:\\tmp
+  const cwd = slashed(tester?.cwd ?? '')
+  expect(cwd).toMatch(/\/tmp\/stress-scout\/proj-[0-9a-f]{8}\/runs\/run-0001-\d+\/snapshot$/)
+  expect(cwd.endsWith(`${slashed(flag('--add-dir') ?? '').replace(/^[A-Za-z]:/, '')}/snapshot`)).toBe(true)
   expect(tester?.env?.STRESS_SCOUT_ROLE).toBe('tester')
   expect(JSON.parse(tester?.env?.STRESS_SCOUT_ROOTS ?? '[]')).toEqual([ROOT])
   expect(tester?.input).toContain('TARGET: src/cache.ts:LruCache.set')
@@ -223,7 +273,7 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   // the report came back: toast, suggestion, the patch read back from the snapshot by git
   expect(w.toasts.at(-1)).toMatch(/^stress-scout #1 broke: lost 1,214/)
   expect(w.suggestions.at(-1)).toBe('Apply stress-scout fix #1: evict before the await')
-  const patchFile = [...w.writes.keys()].find(path => path.endsWith('/fix.patch'))
+  const patchFile = [...w.writes.keys()].find(path => /[\\/]fix\.patch$/.test(path))
   expect(w.writes.get(patchFile ?? '')).toContain('+new')
   expect(w.statuses.at(-1)).toMatch(/watching · 1\/8 runs/)
   const status = await $.command.run(stress('status') as never)
@@ -377,4 +427,76 @@ test('a tree remembered from before the scratch folder was cleaned falls back to
   await clock.settle()
   expect(w.triagePrompts).toHaveLength(1)
   expect(w.spawned).toHaveLength(1)
+})
+
+test('on Windows, snapshots link dependencies as junctions, the tester gets Git Bash paths, and no Unix tool runs', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on, {}, WINDOWS)
+  w.existing.add(`${WIN_ROOT}/node_modules`)
+  await $.session.start({ cwd: WIN_ROOT, surface: 'terminal', isInteractive: true })
+  expect(w.statuses.at(-1)).toMatch(/watching/)
+  await toolCall($, { tool: 'Edit', file_path: `${WIN_ROOT}\\src\\cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+
+  // scratch lives under TEMP, not the Git Bash TMPDIR, and the tester's temp folders point into its run
+  expect(w.spawned).toHaveLength(1)
+  const tester = w.spawned[0]
+  // (the kit runs on Linux, where `C:\\...` is relative, so it prefixes its own folder: match the end)
+  expect(slashed(tester?.cwd ?? '')).toMatch(/C:\/Users\/dev\/AppData\/Local\/Temp\/stress-scout\/proj-[0-9a-f]{8}\/runs\/run-0001-\d+\/snapshot$/)
+  expect(tester?.env?.TEMP).toMatch(/^C:\/Users\/dev\/AppData\/Local\/Temp\/stress-scout\/proj-[0-9a-f]{8}\/runs\/run-0001-\d+\/tmp$/)
+  expect(tester?.env?.TMP).toBe(tester?.env?.TEMP)
+  expect(tester?.env?.TMPDIR).toBe(tester?.env?.TEMP)
+  expect(JSON.parse(tester?.env?.STRESS_SCOUT_ROOTS ?? '[]')).toEqual([WIN_ROOT])
+  expect(tester?.env?.STRESS_SCOUT_HOME).toBe('C:\\Users\\dev')
+  expect(tester?.input).toContain('PLATFORM: Windows')
+  expect(tester?.input).toContain('REAL PROJECT (off-limits; never touch or name it): C:/work/proj')
+  expect(tester?.input).toContain('- Linked from the real project')
+
+  // git checks the snapshot out itself; node_modules is a junction made through PowerShell
+  expect(w.runs.some(argv => argv.includes('checkout-index'))).toBe(true)
+  const scripts = w.runs.filter(argv => argv[0] === 'powershell.exe').map(argv => decodePowerShell(argv.at(-1) ?? ''))
+  const junction = scripts.find(script => script.includes('New-Item -ItemType Junction'))
+  expect(junction).toContain("-Target 'C:\\work\\proj\\node_modules'")
+  expect(junction).toContain('\\snapshot\\node_modules')
+  expect(w.runs.some(argv => ['rm', 'ln', 'tar'].includes(argv[0] ?? ''))).toBe(false)
+  expect(w.toasts.at(-1)).toMatch(/^stress-scout #1 broke/)
+})
+
+test('inside a Windows tester process the guard reads Windows and Git Bash paths', { timeoutMs: 30_000 }, async ($, on) => {
+  const run = 'C:\\Users\\dev\\AppData\\Local\\Temp\\stress-scout\\proj-1234abcd\\runs\\run-0001-1700000000000'
+  mock.clock(on, { now: 1_700_000_000_000 })
+  mock.env(on, {
+    STRESS_SCOUT_ROLE: 'tester',
+    STRESS_SCOUT_ROOTS: JSON.stringify([WIN_ROOT]),
+    STRESS_SCOUT_RUN_DIRS: JSON.stringify([run]),
+    STRESS_SCOUT_HOME: 'C:\\Users\\dev',
+  })
+  on('fs.stat', ($, e) => ({ value: { kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false, realPath: fromDrive(e.path) } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  let ran = 0
+  on('tool.call', () => {
+    ran += 1
+    return { result: 'ok' } as never
+  })
+  await $.session.start({ cwd: `${run}\\snapshot`, surface: null, isInteractive: false })
+
+  const intoProject = await toolCall($, { tool: 'Write', file_path: 'C:\\work\\proj\\src\\a.ts', content: 'x' })
+  expect(JSON.stringify(intoProject)).toContain('stress-scout guard')
+  const throughBash = await toolCall($, { tool: 'Bash', command: 'rm -rf /c/work/proj/src' })
+  expect(JSON.stringify(throughBash)).toContain('read-only for the tester')
+  const secrets = await toolCall($, { tool: 'Read', file_path: 'C:\\Users\\dev\\.ssh\\id_ed25519' })
+  expect(JSON.stringify(secrets)).toContain('secrets')
+  const stream = await toolCall($, { tool: 'Write', file_path: `${run}\\snapshot\\notes.txt:hidden`, content: 'x' })
+  expect(JSON.stringify(stream)).toContain('could not resolve')
+  expect(ran).toBe(0)
+
+  const harness = await toolCall($, { tool: 'Write', file_path: `${run}\\snapshot\\.stress-scout\\h.py`, content: 'print(1)' })
+  expect(JSON.stringify(harness)).not.toContain('stress-scout guard')
+  const forward = await toolCall($, { tool: 'Write', file_path: `${run.replace(/\\\\/g, '/')}/snapshot/.stress-scout/g.py`, content: 'print(2)' })
+  expect(JSON.stringify(forward)).not.toContain('stress-scout guard')
+  const runIt = await toolCall($, { tool: 'Bash', command: 'timeout 120 python .stress-scout/h.py' })
+  expect(JSON.stringify(runIt)).not.toContain('stress-scout guard')
+  expect(ran).toBe(3)
 })
