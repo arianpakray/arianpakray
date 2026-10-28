@@ -11,11 +11,12 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { Finding, Phase, Run, Trigger, Verdict } from '../types'
+import type { Finding, Idea, Phase, Run, Trigger, Verdict } from '../types'
 import { checkBash, checkRead, checkWrite, type Check, type Sandbox } from './lib/policy'
 import {
   HANDOFF,
   HANDOFF_DETAILS,
+  IDEA_SYSTEM,
   TESTER_SYSTEM,
   TRIAGE_SYSTEM,
   changeTriagePrompt,
@@ -28,8 +29,17 @@ import {
   testerTask,
   type Memory,
 } from './lib/prompts'
+import { vetIdea } from './lib/ideas'
 import { rankCandidates } from './lib/rank'
-import { isActionable, parseReport, parseStreamLine, parseTriage, type TesterResult, type Triage } from './lib/report'
+import {
+  isActionable,
+  parseReport,
+  parseStreamLine,
+  parseTriage,
+  type IdeaDraft,
+  type TesterResult,
+  type Triage,
+} from './lib/report'
 import {
   blobsOf,
   changedPaths,
@@ -67,7 +77,9 @@ const TRIAGE_CACHE_MAX_AGE_MS = 7 * 24 * 3_600_000
 
 const phaseAtom = atom({ plugin: 'stress-scout', key: 'phase' } as const, { kind: 'idle', detail: '', since: 0 })
 const findingsAtom = atom({ plugin: 'stress-scout', key: 'findings' } as const, [])
-const activityAtom = atom({ plugin: 'stress-scout', key: 'activity' } as const, [])
+const ideasAtom = atom({ plugin: 'stress-scout', key: 'ideas' } as const, [])
+const ideasUsedAtom = atom({ plugin: 'stress-scout', key: 'ideasUsed' } as const, 0)
+const activityAtom =atom({ plugin: 'stress-scout', key: 'activity' } as const, [])
 const runAtom = atom({ plugin: 'stress-scout', key: 'run' } as const, null)
 const runsUsedAtom = atom({ plugin: 'stress-scout', key: 'runsUsed' } as const, 0)
 const sweepsUsedAtom = atom({ plugin: 'stress-scout', key: 'sweepsUsed' } as const, 0)
@@ -99,6 +111,8 @@ type Config = {
   rateLimitPct: number
   testerTimeoutMs: number
   isOffline: boolean
+  isSuggesting: boolean
+  maxIdeas: number
 }
 
 type Ctx = {
@@ -139,6 +153,8 @@ export function configOf(options: PluginOptions): Config {
     rateLimitPct: numberOf(options.pauseAtRateLimitPercent, 80, 1, 101),
     testerTimeoutMs: numberOf(options.testerTimeoutMinutes, 20, 2, 120) * 60_000,
     isOffline: options.testerOffline !== false,
+    isSuggesting: options.suggestImprovements !== false,
+    maxIdeas: numberOf(options.maxIdeasPerSession, 5, 0, 100),
   }
 }
 
@@ -168,6 +184,10 @@ const live = {
   isCycling: false,
   pending: undefined as Trigger | undefined,
   pendingFocus: undefined as string | undefined,
+  /** the suggestion a queued /stress try is for */
+  pendingIdea: undefined as number | undefined,
+  /** files changed in scans this session, newest last: the only ones an idea may touch */
+  recentEdits: [] as string[],
   lastRunStartedAt: 0,
   seenTree: '',
   seenTreeAt: 0,
@@ -490,16 +510,22 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
  * the code the model is judging (the diff, or the sweep's candidate rows), not the
  * surrounding prompt, which changes with the conversation.
  */
-async function triage($: $, c: Ctx, prompt: string, basis: string): Promise<{ plan?: Triage; tokens: number; error?: string }> {
+async function triage(
+  $: $,
+  c: Ctx,
+  prompt: string,
+  basis: string,
+  isAskingIdea = false,
+): Promise<{ plan?: Triage; tokens: number; error?: string }> {
   const now = await $.clock.now()
-  const key = fnv(`${TRIAGE_VERSION}|${live.config.triageModel}|${basis.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim()}`)
+  const key = fnv(`${TRIAGE_VERSION}|${live.config.triageModel}|${isAskingIdea ? 'idea' : ''}|${basis.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim()}`)
   const hit = (await loadTriageCache($, c))[key]
   if (hit !== undefined && now - hit.at < TRIAGE_CACHE_MAX_AGE_MS) return { plan: { ...hit.plan, files: [...hit.plan.files] }, tokens: 0 }
   const reply = await $.model.complete({
     model: live.config.triageModel,
-    system: TRIAGE_SYSTEM,
+    system: isAskingIdea ? `${TRIAGE_SYSTEM}\n\n${IDEA_SYSTEM}` : TRIAGE_SYSTEM,
     prompt,
-    maxTokens: 700,
+    maxTokens: isAskingIdea ? 900 : 700,
     timeoutMs: 90_000,
   })
   const tokens = tokensOf(reply.usage)
@@ -561,7 +587,9 @@ async function choose(
     if (paths.length > 0) {
       const stat = await diffStat($, c.shadow, base, tree)
       const diff = await diffText($, c.shadow, base, tree, [], 24_000)
-      const result = await triage($, c, changeTriagePrompt({ intent, memory, now, currentHashes, stat, diff }), `${stat}\n${diff}`)
+      live.recentEdits = unique([...live.recentEdits, ...paths]).slice(-40)
+      const edits = config.isSuggesting ? live.recentEdits : undefined
+      const result = await triage($, c, changeTriagePrompt({ intent, memory, now, currentHashes, stat, diff, edits }), `${stat}\n${diff}`, edits !== undefined)
       if (result.plan === undefined) return { kind: 'change', note: result.error ?? 'triage failed' }
       memory.lastTree = tree
       return { chosen: { plan: result.plan, tokens: result.tokens, base }, kind: 'change', note: '' }
@@ -731,6 +759,8 @@ type StartArgs = {
   diff: string
   memoryKey: string
   hash: string
+  /** the suggestion this run builds (`/stress try N`) */
+  idea?: Idea
 }
 
 /** Whether the engine's event types are in the snapshot; copied from the project when only it has them. */
@@ -765,10 +795,12 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     baseTree: args.tree,
     startedAt,
     tokens: args.tokens,
+    fromIdea: args.idea?.id ?? 0,
   }
   await update($, runAtom, () => run)
   await update($, tokensAtom, n => n + args.tokens)
-  if (args.trigger !== 'manual') {
+  // a tried idea counts toward the cap like an automatic run, though the person asked for it
+  if (args.trigger !== 'manual' || args.idea !== undefined) {
     await update($, runsUsedAtom, n => n + 1)
     if (args.trigger === 'sweep') await update($, sweepsUsedAtom, n => n + 1)
   }
@@ -790,12 +822,29 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     isWindows: c.isWindows,
     isPlugin,
     hasTypes,
+    idea: args.idea,
   })
   // the claude process itself needs the API; only the commands it runs lose the network
   const offline = live.config.isOffline ? await probeOffline($, c.isWindows).catch(() => '' as const) : ''
   await log($, `#${args.id} network: ${offline === '' ? 'guard only' : `off (${offline})`}`)
   void superviseTester($, c, run, prompt, offline)
 }
+
+/** The tester's brief for `/stress try N`: build the suggestion in the sandbox, targeting its files. */
+const ideaPlan = (idea: Idea): Plan => ({
+  plan: {
+    isWorth: true,
+    risk: 'high',
+    target: idea.title,
+    files: idea.files,
+    kind: 'edge',
+    why: idea.why,
+    attack: '',
+    skip: '',
+  },
+  tokens: 0,
+  base: '',
+})
 
 const manualPlan = (focus: string): Plan => ({
   plan: {
@@ -812,7 +861,54 @@ const manualPlan = (focus: string): Plan => ({
   base: '',
 })
 
-async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
+async function setIdeaStatus($: $, id: number, status: Idea['status'], from?: Idea['status']): Promise<void> {
+  await update($, ideasAtom, list => list.map(i => (i.id === id && (from === undefined || i.status === from) ? { ...i, status } : i)))
+}
+
+/** Files the triage model's idea when it clears the guardrails, the session cap and what was dismissed before. */
+async function offerIdea($: $, c: Ctx, tree: string, memory: Memory, draft: IdeaDraft | undefined): Promise<void> {
+  const { config } = live
+  if (!config.isSuggesting || draft === undefined || !vetIdea(draft, live.recentEdits).isOk) return
+  if ((await read($, ideasUsedAtom)) >= config.maxIdeas) return
+  const files = unique(draft.files).sort()
+  const blobs = await blobsOf($, c.shadow, tree, files)
+  if (!files.every(file => blobs.has(file))) return
+  const memoryKey = files.join(',')
+  const hash = fnv(files.map(file => `${file}:${blobs.get(file) ?? ''}`).join('|'))
+  if (memory.dismissed[`${memoryKey}|idea`]?.hash === hash) return
+  if ((await read($, ideasAtom)).some(i => i.memoryKey === memoryKey && i.hash === hash)) return
+  const idea: Idea = {
+    id: memory.nextId,
+    at: await $.clock.now(),
+    title: draft.title,
+    why: draft.why,
+    files,
+    size: draft.size === 'M' ? 'M' : 'S',
+    status: 'new',
+    memoryKey,
+    hash,
+  }
+  memory.nextId += 1
+  await update($, ideasAtom, list => [idea, ...list].slice(0, 12))
+  await update($, ideasUsedAtom, n => n + 1)
+  await log($, `idea #${idea.id} (${idea.size}): ${idea.title}`)
+}
+
+async function tryIdea($: $, id: number): Promise<string> {
+  const idea = (await read($, ideasAtom)).find(i => i.id === id)
+  if (idea === undefined) return `No idea #${id}.`
+  if (idea.status === 'dismissed') return `Idea #${id} was dismissed.`
+  if (idea.status === 'trying') return `Idea #${id} is already being tried.`
+  await setIdeaStatus($, id, 'trying')
+  await update($, seenAtom, seen => Math.max(seen, id))
+  $.clock.after(0, () => void kick($, 'manual', idea.title, id))
+  const run = await read($, runAtom)
+  return run !== null
+    ? `Trying idea #${id} after the test of ${run.target} (#${run.id}).`
+    : `Trying idea #${id} in the sandbox. The result lands in /stress show.`
+}
+
+async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
   const { config } = live
   const isManual = trigger === 'manual'
   if (!isManual) {
@@ -849,14 +945,18 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   const memory = await loadMemory($, c)
   const intent = await recentIntent($)
 
+  const idea = ideaId !== undefined ? (await read($, ideasAtom)).find(i => i.id === ideaId) : undefined
   let chosen: Plan | undefined
   let kind: Trigger = trigger
-  if (focus !== undefined && focus.trim() !== '') {
+  if (idea !== undefined) {
+    chosen = ideaPlan(idea)
+  } else if (focus !== undefined && focus.trim() !== '') {
     chosen = manualPlan(focus)
   } else {
     const result = await choose($, c, trigger, tree, memory, intent)
     chosen = result.chosen
     kind = isManual ? 'manual' : result.kind
+    if (chosen !== undefined && result.kind === 'change') await offerIdea($, c, tree, memory, chosen.plan.idea)
     if (chosen === undefined) {
       await saveMemory($, c, memory)
       if (result.note !== NO_CHANGE || isManual) await log($, `${kind}: ${result.note}`)
@@ -877,7 +977,9 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   const blobs = await blobsOf($, c.shadow, tree, plan.files)
   plan.files = plan.files.filter(file => blobs.has(file))
   const sorted = [...plan.files].sort()
-  const memoryKey = sorted.length > 0 ? sorted.join(',') : clip(plan.target, 200)
+  const targetKey = sorted.length > 0 ? sorted.join(',') : clip(plan.target, 200)
+  // a tried idea has its own memory: it must not mark the files tested, or hide them from the next scan
+  const memoryKey = idea !== undefined ? clip(`idea:${targetKey}`, 200) : targetKey
   const hash =
     sorted.length > 0 ? fnv(sorted.map(file => `${file}:${blobs.get(file) ?? ''}`).join('|')) : fnv(`${plan.target}:${tree}`)
   if (!isManual) {
@@ -900,22 +1002,27 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   const id = memory.nextId
   memory.nextId += 1
   await saveMemory($, c, memory)
-  await startRun($, c, { id, trigger: kind, plan, tokens, intent, tree, diff, memoryKey, hash })
+  await startRun($, c, { id, trigger: kind, plan, tokens, intent, tree, diff, memoryKey, hash, idea })
 }
 
-async function kick($: $, trigger: Trigger, focus?: string): Promise<void> {
+async function kick($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
   if (live.isCycling || (await read($, runAtom)) !== null) {
     if (live.pending === undefined || PRIORITY[trigger] > PRIORITY[live.pending]) live.pending = trigger
-    if (focus !== undefined) live.pendingFocus = focus
+    if (focus !== undefined) {
+      live.pendingFocus = focus
+      live.pendingIdea = ideaId
+    }
     return
   }
   live.isCycling = true
   try {
-    await cycle($, trigger, focus)
+    await cycle($, trigger, focus, ideaId)
   } catch (error) {
     await log($, `${trigger}: ${messageOf(error)}`)
     await setPhase($, 'idle')
   } finally {
+    // an idea that never reached a tester goes back to waiting for another try
+    if (ideaId !== undefined && (await read($, runAtom)) === null) await setIdeaStatus($, ideaId, 'new', 'trying')
     live.isCycling = false
     void drainPending($)
   }
@@ -925,9 +1032,11 @@ async function drainPending($: $): Promise<void> {
   if (live.pending === undefined || live.isCycling || (await read($, runAtom)) !== null) return
   const trigger = live.pending
   const focus = live.pendingFocus
+  const ideaId = live.pendingIdea
   live.pending = undefined
   live.pendingFocus = undefined
-  $.clock.after(2000, () => void kick($, trigger, focus))
+  live.pendingIdea = undefined
+  $.clock.after(2000, () => void kick($, trigger, focus, ideaId))
 }
 
 async function cleanupRuns($: $, c: Ctx): Promise<void> {
@@ -1012,6 +1121,7 @@ const blankFinding = (run: Run, at: number): Finding => ({
   cost: 0,
   memoryKey: run.memoryKey,
   hash: run.hash,
+  fromIdea: run.fromIdea,
 })
 
 async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
@@ -1071,9 +1181,12 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
   const verified = finding.isVerified ? ' · fix verified' : ''
   const spent = outcome.cost > 0 ? `, ${dollars(outcome.cost)}` : ''
   await log($, `#${run.id} ${finding.verdict}: ${finding.headline}${verified} (${ago(finding.durationMs)}${spent})`)
+  if (run.fromIdea > 0) await setIdeaStatus($, run.fromIdea, 'tried', 'trying')
   if (isActionable(finding.verdict)) {
     $.ui.toast(`stress-scout #${run.id} ${finding.verdict}: ${clip(finding.headline, 120)}`, { timeoutMs: 8000 })
     await maybeSuggest($)
+  } else if (run.fromIdea > 0) {
+    $.ui.toast(`stress-scout tried idea #${run.fromIdea} (#${run.id} ${finding.verdict}): ${clip(finding.headline, 120)}`, { timeoutMs: 8000 })
   }
   await setPhase($, 'idle')
   if (c !== undefined) await cleanupRuns($, c)
@@ -1222,7 +1335,10 @@ async function showPane($: $, id: number): Promise<void> {
 
 async function apply($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
-  if (finding === undefined) return `No finding #${id}.`
+  if (finding === undefined) {
+    const isIdea = (await read($, ideasAtom)).some(i => i.id === id)
+    return isIdea ? `Idea #${id} is untested: /stress try ${id} builds and checks it first.` : `No finding #${id}.`
+  }
   if (finding.patch === '' && finding.nextStep === '') return `Finding #${id} has no fix to hand over.`
   // a regressed fix may be handed over again; one that holds may not
   if (finding.status === 'handing' || finding.status === 'applied' || finding.status === 'fixed') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
@@ -1285,9 +1401,24 @@ async function handOff($: $, finding: Finding): Promise<void> {
   }
 }
 
+async function dismissIdea($: $, idea: Idea): Promise<string> {
+  await setIdeaStatus($, idea.id, 'dismissed')
+  await update($, seenAtom, seen => Math.max(seen, idea.id))
+  const c = await ensureCtx($)
+  if (c !== undefined) {
+    const memory = await loadMemory($, c)
+    memory.dismissed[`${idea.memoryKey}|idea`] = { at: await $.clock.now(), hash: idea.hash }
+    await saveMemory($, c, memory)
+  }
+  return `Dismissed idea #${idea.id}; it won't be suggested again unless that code changes.`
+}
+
 async function dismiss($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
-  if (finding === undefined) return `No finding #${id}.`
+  if (finding === undefined) {
+    const idea = (await read($, ideasAtom)).find(i => i.id === id)
+    return idea !== undefined ? dismissIdea($, idea) : `No finding #${id}.`
+  }
   await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status: 'dismissed' as const } : f)))
   await update($, seenAtom, seen => Math.max(seen, id))
   const c = await ensureCtx($)
@@ -1378,9 +1509,10 @@ function nextText(waiting: string, runsUsed: number): string {
 
 async function statusText($: $): Promise<string> {
   const { config } = live
-  const [phase, findings, runsUsed, tokens, spent, paused, run, waiting] = await Promise.all([
+  const [phase, findings, ideas, runsUsed, tokens, spent, paused, run, waiting] = await Promise.all([
     read($, phaseAtom),
     read($, findingsAtom),
+    read($, ideasAtom),
     read($, runsUsedAtom),
     read($, tokensAtom),
     read($, dollarsAtom),
@@ -1402,10 +1534,13 @@ async function statusText($: $): Promise<string> {
     `automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} and ${compactTokens(tokens)} tokens this session · triage ${config.triageModel}, tester ${config.testerModel}`,
   ]
   for (const f of findings.slice(0, 6)) {
-    const flags = `${f.isVerified ? ' (fix verified)' : ''}${f.status !== 'new' ? ` [${f.status}]` : ''}`
+    const flags = `${f.isVerified ? ' (fix verified)' : ''}${f.fromIdea > 0 ? ` (from idea #${f.fromIdea})` : ''}${f.status !== 'new' ? ` [${f.status}]` : ''}`
     lines.push(`#${f.id} ${f.verdict} ${f.target}: ${f.headline}${flags}`)
   }
   if (findings.length === 0) lines.push('No findings yet.')
+  for (const idea of ideas.filter(i => i.status !== 'dismissed').slice(0, 3)) {
+    lines.push(`idea #${idea.id} (${idea.size}) ${idea.title}${idea.status !== 'new' ? ` [${idea.status}]` : ''}`)
+  }
   return lines.join('\n')
 }
 
@@ -1415,8 +1550,9 @@ const HELP = [
   '/stress show       open the Stress Scout pane',
   '/stress status     what it is doing and what it found',
   '/stress apply [N]  hand finding N to Claude (patch and evidence attached); no N: the newest one with a fix',
-  '/stress dismiss N  drop finding N; it is not raised again unless the code changes',
+  '/stress dismiss N  drop finding or idea N; it is not raised again unless the code changes',
   '/stress dismiss N all  drop every finding of that kind in finding N\'s file, until the file changes',
+  '/stress try N      build idea N in the sandbox and measure it; the result is a finding that links back to it',
   '/stress stop       stop the running test',
   '/stress pause | resume | forget',
 ].join('\n')
@@ -1445,8 +1581,10 @@ async function runCommand($: $, args: string): Promise<string> {
       if (rest[0] === undefined || rest[0] === '') return applyNewest($)
       return Number.isInteger(n) && n > 0 ? apply($, n) : 'Usage: /stress apply [finding number]'
     case 'dismiss':
-      if (!Number.isInteger(n) || n <= 0) return 'Usage: /stress dismiss <finding number> [all]'
+      if (!Number.isInteger(n) || n <= 0) return 'Usage: /stress dismiss <finding or idea number> [all]'
       return (rest[1] ?? '').toLowerCase() === 'all' ? dismissAll($, n) : dismiss($, n)
+    case 'try':
+      return Number.isInteger(n) && n > 0 ? tryIdea($, n) : 'Usage: /stress try <idea number>'
     case 'forget':
       return forget($)
     case 'help':
@@ -1467,7 +1605,7 @@ async function onSessionStart($: $): Promise<void> {
   await $.command.register({
     name: 'stress',
     description: 'stress-scout: stress-test the latest changes now (or a focus you name); show, status, stop, pause, resume',
-    argumentHint: '[focus | show | status | stop | pause | resume | apply [N] | dismiss N [all] | forget]',
+    argumentHint: '[focus | show | status | stop | pause | resume | apply [N] | try N | dismiss N [all] | forget]',
   })
   const stale = await read($, runAtom)
   if (stale !== null) {
@@ -1587,17 +1725,30 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (live.role === 'tester' || e.props.hasSurvey) return next(e)
-    const [findings, seenId, runsUsed] = await Promise.all([read($, findingsAtom), read($, seenAtom), read($, runsUsedAtom)])
+    const [findings, ideas, seenId, runsUsed] = await Promise.all([read($, findingsAtom), read($, ideasAtom), read($, seenAtom), read($, runsUsedAtom)])
     const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.id > seenId)
-    if (finding === undefined) return next(e)
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const isGraphical = e.surface !== 'terminal'
+    if (finding === undefined) {
+      // an idea gets one quiet line, only while no broke/degraded finding waits and until it is seen
+      const idea = ideas.find(i => i.status === 'new' && i.id > seenId)
+      if (idea === undefined || findings.some(f => f.status === 'new' && isActionable(f.verdict))) return next(e)
+      return (
+        <Box flexDirection="row" gap={isGraphical ? 'sm' : 1}>
+          <Text dimColor wrap="truncate-end" size={isGraphical ? 'footnote' : undefined}>
+            {`stress-scout idea #${idea.id} (${idea.size}): ${idea.title}`}
+          </Text>
+          <Button key="try" label="Try it" hotkey="t" onPress={() => void tryIdea($, idea.id)} />
+          <Button key="dismiss" label="Dismiss" hotkey="x" onPress={() => void dismiss($, idea.id)} />
+        </Box>
+      )
+    }
     const { maxDollarsPerRun, maxRuns } = live.config
     const tidy = (n: number): string => dollars(n).replace(/\.00$/, '')
     const budget =
       finding.cost > 0
         ? `${dollars(finding.cost)} · ${tidy(Math.max(0, maxDollarsPerRun - finding.cost))} left of ${tidy(maxDollarsPerRun)} per run · ${runsUsed}/${maxRuns} runs`
         : ''
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const isGraphical = e.surface !== 'terminal'
     const delta = finding.before !== '' && finding.after !== '' ? ` (${finding.before} → ${finding.after})` : ''
     // a graphical surface draws the band as a card edged in the verdict's theme color
     const card = isGraphical
@@ -1647,9 +1798,10 @@ export const register: Register = (on, options) => {
     const { config } = live
     // the terminal keeps its compact rows; a graphical surface (the app, an editor, a phone) gets cards
     const isGraphical = e.surface !== 'terminal'
-    const [phase, findings, activity, runsUsed, tokens, spent, paused, openId, run, waiting] = await Promise.all([
+    const [phase, findings, ideas, activity, runsUsed, tokens, spent, paused, openId, run, waiting] = await Promise.all([
       read($, phaseAtom),
       read($, findingsAtom),
+      read($, ideasAtom),
       read($, activityAtom),
       read($, runsUsedAtom),
       read($, tokensAtom),
@@ -1742,7 +1894,7 @@ export const register: Register = (on, options) => {
                   <Box flexDirection="row" gap={row}>
                     <Text color={verdictColor(f.verdict)} bold weight="semibold">{`#${f.id} ${f.verdict}`}</Text>
                     <Text wrap="truncate-end" dimColor={!isNew} mono={isGraphical}>
-                      {`${f.target} · ${f.kind}${!isNew ? ` · ${f.status}` : ''}`}
+                      {`${f.target} · ${f.kind}${f.fromIdea > 0 ? ` · idea #${f.fromIdea}` : ''}${!isNew ? ` · ${f.status}` : ''}`}
                     </Text>
                   </Box>
                   {f.plain !== '' && (
@@ -1798,6 +1950,42 @@ export const register: Register = (on, options) => {
             })}
           </Box>
         ))}
+        {ideas.some(i => i.status !== 'dismissed') && (
+          <Box flexDirection="column" gap={row}>
+            <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>
+              Ideas
+            </Text>
+            {ideas
+              .filter(i => i.status !== 'dismissed')
+              .slice(0, 5)
+              .map(i => {
+                const card = isGraphical
+                  ? { borderStyle: 'round', borderColor: 'subtle', borderDimColor: true, padding: 'sm' as const, gap: 'xs' as const }
+                  : {}
+                return (
+                  <Box key={`idea-${i.id}`} flexDirection="column" {...card}>
+                    <Text dimColor wrap="truncate-end" mono={isGraphical}>
+                      {`#${i.id} idea · ${i.size} · ${i.files.join(', ')}${i.status !== 'new' ? ` · ${i.status}` : ''}`}
+                    </Text>
+                    <Text dimColor wrap="wrap">
+                      {i.title}
+                    </Text>
+                    {i.why !== '' && (
+                      <Text dimColor size="footnote" wrap="wrap">
+                        {i.why}
+                      </Text>
+                    )}
+                    {i.status !== 'trying' && (
+                      <Box flexDirection="row" gap={row}>
+                        <Button key={`try-${i.id}`} label={i.status === 'tried' ? 'Try again' : 'Try it'} onPress={() => void tryIdea($, i.id)} />
+                        <Button key={`dismiss-${i.id}`} label="Dismiss" onPress={() => void dismiss($, i.id)} />
+                      </Box>
+                    )}
+                  </Box>
+                )
+              })}
+          </Box>
+        )}
         {activity.length > 0 && (
           <Box flexDirection="column" gap={isGraphical ? 'xs' : 0}>
             <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>
