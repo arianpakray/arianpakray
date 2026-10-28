@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
@@ -82,7 +82,7 @@
     "pauseAtRateLimitPercent": {
       "type": "number",
       "title": "Pause at rate-limit %",
-      "description": "Skip automatic runs while your 5-hour usage window is at or above this percent.",
+      "description": "Skip automatic runs while your 5-hour or weekly usage window (or a gateway's spend limit) is at or above this percent.",
       "default": 80
     },
     "testerTimeoutMinutes": {
