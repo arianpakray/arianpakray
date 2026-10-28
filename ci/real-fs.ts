@@ -160,12 +160,14 @@ write(readOnly, 'x')
 Bun.spawnSync(isWindows ? ['attrib', '+R', readOnly] : ['chmod', '444', readOnly])
 check('a tree holding a read-only file deletes', (await removeTree($, join(base, 'ro'), isWindows)) && !existsSync(join(base, 'ro')))
 
-// a path that starts with '-' is deleted, not read as an option
+// a path that starts with '-' is deleted, not read as an option (rm's concern: PowerShell takes it quoted,
+// and its delete reads the path as an extended \\?\ one, which is absolute by definition)
 const here = process.cwd()
 process.chdir(base)
 for (const name of ['-rf', '-d']) {
   write(join(base, name, 'x'), 'x')
-  check(`a folder named ${name} deletes`, (await removeTree($, name, isWindows)) && !existsSync(join(base, name)))
+  const path = isWindows ? join(base, name) : name
+  check(`a folder named ${name} deletes`, (await removeTree($, path, isWindows)) && !existsSync(join(base, name)))
 }
 process.chdir(here)
 
