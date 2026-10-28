@@ -299,7 +299,17 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
     expect(await ui.find({ text: /stress-scout #1 broke/ })).toBeDefined()
     expect(await ui.find({ key: 'apply' })).toBeDefined()
     expect(await ui.find({ text: /verified fix: evict before the await/ })).toBeDefined()
+    // a graphical surface draws the band as one card edged in the verdict's color; the terminal keeps bare rows
+    const cards = (await ui.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round')
+    expect(cards).toHaveLength(surface === 'terminal' ? 0 : 1)
+    if (surface !== 'terminal') expect(cards[0]?.props.borderColor).toBe('error')
     await ui.unmount()
+
+    const pane = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'Pane', requestId: 'stress-scout', props: PANE })
+    expect(await pane.find({ text: /#1 broke/ })).toBeDefined()
+    const paneCards = (await pane.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round')
+    expect(paneCards).toHaveLength(surface === 'terminal' ? 0 : 1)
+    await pane.unmount()
   }
 
   // one press hands it over in full; the band then steps aside
