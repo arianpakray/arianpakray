@@ -991,6 +991,8 @@ const blankFinding = (run: Run, at: number): Finding => ({
   kind: run.kind,
   verdict: 'inconclusive',
   headline: '',
+  plain: '',
+  plainFix: '',
   evidence: '',
   before: '',
   after: '',
@@ -1035,6 +1037,8 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
     kind: report?.kind || run.kind,
     verdict: report?.verdict ?? 'inconclusive',
     headline: report?.headline || outcome.failure || 'the tester finished without a report',
+    plain: report?.plain ?? '',
+    plainFix: report?.plainFix ?? '',
     evidence: report?.evidence ?? clip(oneLine(outcome.answer || outcome.failure), 600),
     before: report?.before ?? '',
     after: report?.after ?? '',
@@ -1605,12 +1609,22 @@ export const register: Register = (on, options) => {
           <Text color={verdictColor(finding.verdict)} bold weight="semibold">
             {`stress-scout #${finding.id} ${finding.verdict}`}
           </Text>
-          <Text wrap="truncate-end" mono={isGraphical}>{`${finding.target}: ${finding.headline}`}</Text>
+          {finding.plain !== '' ? (
+            <Text wrap="wrap">{finding.plain}</Text>
+          ) : (
+            <Text wrap="truncate-end" mono={isGraphical}>{`${finding.target}: ${finding.headline}`}</Text>
+          )}
         </Box>
-        {finding.fixSummary !== '' && (
+        {finding.plain !== '' && finding.plainFix !== '' ? (
           <Text dimColor wrap="truncate-end" size="footnote">
-            {`${finding.isVerified ? 'verified fix' : 'unverified fix'}: ${finding.fixSummary}${delta}`}
+            {`${finding.isVerified ? 'Fix (tested)' : 'Fix (not tested)'}: ${finding.plainFix}`}
           </Text>
+        ) : (
+          finding.fixSummary !== '' && (
+            <Text dimColor wrap="truncate-end" size="footnote">
+              {`${finding.isVerified ? 'verified fix' : 'unverified fix'}: ${finding.fixSummary}${delta}`}
+            </Text>
+          )
         )}
         {budget !== '' && (
           <Text key="budget" dimColor wrap="truncate-end" size="footnote" tabular>
@@ -1731,9 +1745,19 @@ export const register: Register = (on, options) => {
                       {`${f.target} · ${f.kind}${!isNew ? ` · ${f.status}` : ''}`}
                     </Text>
                   </Box>
-                  <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={isGraphical && !isNew}>
+                  {f.plain !== '' && (
+                    <Text wrap="wrap" dimColor={isGraphical && !isNew}>
+                      {f.plain}
+                    </Text>
+                  )}
+                  <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={f.plain !== '' || (isGraphical && !isNew)}>
                     {f.headline}
                   </Text>
+                  {f.plain !== '' && f.plainFix !== '' && (
+                    <Text dimColor size="footnote" wrap="wrap">
+                      {`${f.isVerified ? 'Fix (tested)' : 'Fix (not tested)'}: ${f.plainFix}`}
+                    </Text>
+                  )}
                   {f.fixSummary !== '' && (
                     <Text dimColor size="footnote" wrap={isOpen ? 'wrap' : 'truncate-end'}>
                       {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}

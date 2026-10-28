@@ -18,6 +18,10 @@ export type Finding = {
   kind: string
   verdict: Verdict
   headline: string
+  /** What went wrong, in everyday words; empty on findings from before the tester wrote one */
+  plain: string
+  /** The fix, in everyday words */
+  plainFix: string
   evidence: string
   before: string
   after: string
