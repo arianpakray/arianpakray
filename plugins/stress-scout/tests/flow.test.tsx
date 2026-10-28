@@ -138,6 +138,8 @@ type World = {
   surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
+  /** What `$.store` holds: seeded from the stored values, and written to as the plugin runs. */
+  store: Map<string, unknown>
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -163,8 +165,18 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     opened: [],
     surfaces: ['desktop'],
     reports: [],
+    store: new Map(Object.entries(stored)),
   }
-  mock.store(on, stored)
+  on('store.get', ($, e) => ({ value: w.store.get(e.key) }))
+  on('store.set', ($, e) => {
+    w.store.set(e.key, JSON.parse(JSON.stringify(e.value)))
+    return { value: undefined }
+  })
+  on('store.delete', ($, e) => {
+    w.store.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...w.store.keys()] }))
   mock.env(on, place.env)
   const spell = /^[A-Za-z]:/.test(place.root) ? fromDrive : posixOf
   on('session.root', () => ({ value: place.root }))
@@ -195,7 +207,8 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     if (argv.includes('--stat')) return ok(' src/cache.ts | 4 ++--\n')
     if (e.argv.includes('--diff-filter=MRD')) return ok(PATCH)
     if (e.argv.includes('--diff-filter=A')) return ok('')
-    if (e.argv.includes('diff')) return ok('@@ -1 +1 @@\n-old\n+new\n')
+    // the diff differs per tree, as real edits do: triage verdicts are cached by what the diff says
+    if (e.argv.includes('diff')) return ok(`@@ -1 +1 @@\n-old\n+new ${w.tree}\n`)
     if (e.argv.includes('ls-tree')) return ok(`100644 blob ${BLOB}     900\tsrc/cache.ts\n`)
     return ok()
   })
@@ -719,4 +732,95 @@ test('a bare /stress and a prompt with empty text pass through', { timeoutMs: 30
   await $.prompt.submit({ text: '', wait: false, origin: { kind: 'composer' } })
   expect(w.submitted).toHaveLength(count + 1)
   expect(w.submitted.at(-1)?.context ?? []).toHaveLength(0)
+})
+
+/** One edit that moves the tree to `tree`, then the quiet period: whatever it triaged has run. */
+async function editAndSettle($: Parameters<typeof toolCall>[0],clock: ReturnType<typeof mock.clock>, w: World, tree: string): Promise<void> {
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = tree
+  await clock.advance(5 * 60_000)
+  await clock.settle()
+}
+
+const TRIAGE_KEY = `triage:${fnv(ROOT)}`
+const MEMORY_KEY = `mem:${fnv(ROOT)}`
+const WEEK = 7 * 24 * 3_600_000
+const cacheOf = (w: World): Record<string, unknown> => (w.store.get(TRIAGE_KEY) ?? {}) as Record<string, unknown>
+
+test('triage: the same change is judged once, in this session and in a later one with the same stored data', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await editAndSettle($, clock, w, TREE_B)
+  expect(w.triagePrompts).toHaveLength(1)
+  expect(Object.keys(cacheOf(w))).toHaveLength(1)
+
+  // a different change is a new question
+  await editAndSettle($, clock, w, TREE_C)
+  expect(w.triagePrompts).toHaveLength(2)
+  expect(Object.keys(cacheOf(w))).toHaveLength(2)
+
+  // a later session remembers nothing of what it scanned or tested, only the stored verdicts, and meets the first change again
+  w.store.delete(MEMORY_KEY)
+  await editAndSettle($, clock, w, TREE_B)
+  expect(w.triagePrompts).toHaveLength(2)
+})
+
+test('triage: a verdict older than a week is asked again', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await editAndSettle($, clock, w, TREE_B)
+  expect(w.triagePrompts).toHaveLength(1)
+
+  // while fresh, the verdict is reused by a session that remembers nothing else
+  w.store.delete(MEMORY_KEY)
+  await editAndSettle($, clock, w, TREE_A)
+  await editAndSettle($, clock, w, TREE_B)
+  expect(w.triagePrompts).toHaveLength(2)
+
+  // the stored verdict is now a week and a day old, and the session remembers nothing else
+  const aged = Object.fromEntries(Object.entries(cacheOf(w)).map(([key, entry]) => [key, { ...(entry as object), at: 1_700_000_000_000 - WEEK - 24 * 3_600_000 }]))
+  w.store.set(TRIAGE_KEY, aged)
+  w.store.delete(MEMORY_KEY)
+  await editAndSettle($, clock, w, TREE_A)
+  await editAndSettle($, clock, w, TREE_B)
+  expect(w.triagePrompts).toHaveLength(4)
+})
+
+test('triage: the cache keeps the newest 200 verdicts and drops the aged ones', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const plan = { isWorth: true, risk: 'high', target: 't', files: [], kind: 'edge', why: '', attack: '', skip: '' }
+  const full: Record<string, unknown> = { aged: { at: 1_700_000_000_000 - WEEK - 1, plan } }
+  for (let i = 0; i < 200; i++) full[`old${i}`] = { at: 1_700_000_000_000 - 1000 + i, plan }
+  const w = world(on, { [TRIAGE_KEY]: full })
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await editAndSettle($, clock, w, TREE_B)
+  expect(w.triagePrompts).toHaveLength(1)
+  const kept = Object.keys(cacheOf(w))
+  expect(kept).toHaveLength(200)
+  expect(kept).not.toContain('old0')
+  expect(kept).not.toContain('aged')
+})
+
+test('an idle sweep waits until sweepMinutes after the last run of any kind', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const memory = { v: 1, lastTree: TREE_A, lastSweepAt: 0, nextId: 1, touchedAt: 0, tested: {}, dismissed: {} }
+  const w = world(on, { [MEMORY_KEY]: memory })
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  // a manual test runs and finishes; the session then sits idle
+  await $.command.run(stress('the retry loop in api/client.ts') as never)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+  await clock.advance(19 * 60_000)
+  await clock.settle()
+  expect(w.triagePrompts).toHaveLength(0)
+  expect(w.spawned).toHaveLength(1)
+
+  // the gap has passed since that run finished: the sweep goes ahead
+  await clock.advance(2 * 60_000)
+  await clock.settle()
+  expect(w.triagePrompts).toHaveLength(1)
+  expect(w.triagePrompts[0]).toContain('idle sweep')
+  expect(w.spawned).toHaveLength(2)
 })
