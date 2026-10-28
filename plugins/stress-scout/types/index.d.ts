@@ -28,6 +28,23 @@ export type Finding = {
   cost: number
   memoryKey: string
   hash: string
+  /** the id of the suggestion this finding is the result of trying; 0 when it came from a normal run */
+  fromIdea: number
+}
+
+/** A suggested small improvement: not a verdict, no tester run and no patch until the person tries it. */
+export type Idea = {
+  id: number
+  at: number
+  /** what to add or change */
+  title: string
+  /** why, in one line */
+  why: string
+  files: string[]
+  size: 'S' | 'M'
+  status: 'new' | 'trying' | 'tried' | 'dismissed'
+  memoryKey: string
+  hash: string
 }
 
 export type Phase = {
@@ -51,6 +68,8 @@ export type Run = {
   baseTree: string
   startedAt: number
   tokens: number
+  /** the suggestion this run builds; 0 for a normal run */
+  fromIdea: number
 }
 
 declare module 'claude-code' {
@@ -58,6 +77,9 @@ declare module 'claude-code' {
     'stress-scout': {
       phase: Phase
       findings: Finding[]
+      ideas: Idea[]
+      /** suggestions shown this session, counted against maxIdeasPerSession */
+      ideasUsed: number
       activity: Activity[]
       run: Run | null
       runsUsed: number

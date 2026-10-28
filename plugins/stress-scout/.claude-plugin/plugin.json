@@ -85,6 +85,18 @@
       "description": "When a test proves its own fix and the session has been idle for the idle seconds, send the fix to Claude without a tap.",
       "default": true
     },
+    "suggestImprovements": {
+      "type": "boolean",
+      "title": "Suggest improvements",
+      "description": "Now and then, the same triage call also suggests one small improvement to what you are building; it shows under Ideas in the pane, and /stress try N builds and checks it in the sandbox.",
+      "default": true
+    },
+    "maxIdeasPerSession": {
+      "type": "number",
+      "title": "Max ideas per session",
+      "description": "Hard cap on suggested improvements shown in one session.",
+      "default": 5
+    },
     "claudePath": {
       "type": "string",
       "title": "Path to the claude binary",

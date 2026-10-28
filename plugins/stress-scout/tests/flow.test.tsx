@@ -120,6 +120,10 @@ type World = {
   submitted: { text: string; context: readonly string[] }[]
   writes: Map<string, string>
   triagePrompts: string[]
+  /** the triage model's next answer */
+  triage: string
+  /** the files git reports as changed and as present in every tree */
+  files: string[]
   /** A slash command's hook is running: the host refuses a prompt.submit then, as the real one does. */
   isInCommand: boolean
   /** Trees the shadow repository does not hold (it was rebuilt since): git refuses to read them. */
@@ -154,6 +158,8 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     submitted: [],
     writes: new Map(),
     triagePrompts: [],
+    triage: TRIAGE,
+    files: ['src/cache.ts'],
     isInCommand: false,
     missingTrees: new Set(),
     runs: [],
@@ -191,12 +197,12 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     if (argv.includes('rev-parse --path-format')) return ok(`${ROOT}/.git\n`)
     if (argv.includes('rev-parse --verify')) return ok(`${HEAD}\n`)
     if (argv.endsWith('write-tree')) return ok(`${index.endsWith('snapshot.index') ? AFTER : w.tree}\n`)
-    if (argv.includes('--name-only')) return ok('src/cache.ts\n')
+    if (argv.includes('--name-only')) return ok(`${w.files.join('\n')}\n`)
     if (argv.includes('--stat')) return ok(' src/cache.ts | 4 ++--\n')
     if (e.argv.includes('--diff-filter=MRD')) return ok(PATCH)
     if (e.argv.includes('--diff-filter=A')) return ok('')
     if (e.argv.includes('diff')) return ok('@@ -1 +1 @@\n-old\n+new\n')
-    if (e.argv.includes('ls-tree')) return ok(`100644 blob ${BLOB}     900\tsrc/cache.ts\n`)
+    if (e.argv.includes('ls-tree')) return ok(w.files.map(file => `100644 blob ${BLOB}     900\t${file}\n`).join(''))
     return ok()
   })
   // the headless tester: a few stream-json lines, the last one cut off without its newline
@@ -212,7 +218,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
   } as never)
   on('model.complete', ($, e) => {
     w.triagePrompts.push(String(e.prompt))
-    return { value: { isAnswered: true as const, text: TRIAGE, usage: USAGE } }
+    return { value: { isAnswered: true as const, text: w.triage, usage: USAGE } }
   })
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('ui.status', ($, e) => {
@@ -719,4 +725,290 @@ test('a bare /stress and a prompt with empty text pass through', { timeoutMs: 30
   await $.prompt.submit({ text: '', wait: false, origin: { kind: 'composer' } })
   expect(w.submitted).toHaveLength(count + 1)
   expect(w.submitted.at(-1)?.context ?? []).toHaveLength(0)
+})
+
+describe('improvement scout', () => {
+  const IDEA = {
+    title: 'Show the eviction count in the cache stats',
+    why: 'the new LRU path has no visibility',
+    files: ['src/cache.ts'],
+    size: 'S',
+    type: 'feature',
+    value: 9,
+  }
+  /** a triage answer that stress-tests nothing but carries an idea */
+  const withIdea = (idea: unknown, worth = false): string => JSON.stringify({ ...JSON.parse(TRIAGE), worth, idea })
+  type Engine = Parameters<NonNullable<Parameters<typeof test>[2]>>[0]
+  const paneOf = ($: Engine, surface: (typeof SURFACES)[number] = 'desktop') =>
+    $.ui.mount({ plugin: 'stress-scout', surface, component: 'Pane', requestId: 'stress-scout', props: PANE })
+  const bandOf = ($: Engine, surface: (typeof SURFACES)[number] = 'desktop') =>
+    $.ui.mount({ plugin: 'stress-scout', surface, component: 'AbovePrompt', props: BAND })
+
+  test('a triage that offers an idea adds one Ideas entry, with no extra model call and nothing handed over', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+
+    // the question rode on the one triage call, with the recent edits and the latest prompt
+    expect(w.triagePrompts).toHaveLength(1)
+    expect(w.triagePrompts[0]).toContain('RECENT EDITS')
+    expect(w.triagePrompts[0]).toContain('LATEST PROMPT (what the idea should serve): make the LRU cache safe')
+    expect(w.spawned).toHaveLength(0)
+    const status = await $.command.run(stress('status') as never)
+    expect(status.text).toContain('idea #1 (S) Show the eviction count in the cache stats')
+
+    for (const surface of SURFACES) {
+      const pane = await paneOf($, surface)
+      expect(await pane.find({ text: /^Ideas$/ })).toBeDefined()
+      expect(await pane.find({ text: /Show the eviction count/ })).toBeDefined()
+      expect(await pane.find({ key: 'try-1' })).toBeDefined()
+      expect(await pane.find({ key: 'dismiss-1' })).toBeDefined()
+      // a raw idea is never offered for Apply
+      expect(await pane.findAll({ key: 'apply-1' })).toHaveLength(0)
+      await pane.unmount()
+    }
+
+    // the band shows one quiet line, and the engine's prompt suggestion stays free
+    const band = await bandOf($)
+    expect(await band.find({ text: /stress-scout idea #1 \(S\): Show the eviction count/ })).toBeDefined()
+    expect(await band.find({ key: 'try' })).toBeDefined()
+    await band.unmount()
+    expect(w.suggestions).toHaveLength(0)
+
+    // the same triage answer for unchanged code adds nothing; the model is still asked once per scan
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'new', new_string: 'newer' })
+    w.tree = TREE_C
+    await clock.advance(45_000)
+    await clock.settle()
+    expect(w.triagePrompts).toHaveLength(2)
+    expect(((await $.command.run(stress('status') as never)).text ?? '').match(/idea #\d/g)).toHaveLength(1)
+
+    // hands-off mode hands verified fixes over, never an idea
+    await clock.advance(10 * 60_000)
+    await clock.settle()
+    expect(w.submitted).toHaveLength(0)
+    expect(w.suggestions).toHaveLength(0)
+    const applied = await $.command.run(stress('apply 1') as never)
+    expect(applied.text).toContain('untested')
+    await clock.settle()
+    expect(w.submitted).toHaveLength(0)
+  })
+
+  test('/stress try N runs the tester on the idea, and its finding links back to it', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    expect(w.spawned).toHaveLength(0)
+
+    expect((await $.command.run(stress('try 9') as never)).text).toBe('No idea #9.')
+    w.reports.push(
+      REPORT.replace('"verdict":"broke"', '"verdict":"held"').replace('lost 1,214 of 10,000 writes under 64 writers', 'eviction count shown, no slowdown'),
+    )
+    const tried = await $.command.run(stress('try 1') as never)
+    expect(tried.text).toContain('Trying idea #1')
+    await clock.settle()
+
+    // the tester was briefed on the suggestion and aimed at its files
+    expect(w.spawned).toHaveLength(1)
+    const input = w.spawned[0]?.input ?? ''
+    expect(input).toContain('IMPROVEMENT TO TRY (idea #1, size S; not a bug hunt): Show the eviction count in the cache stats')
+    expect(input).toContain('FILES: src/cache.ts')
+    // the triage was not asked again
+    expect(w.triagePrompts).toHaveLength(1)
+
+    // the result is a normal finding that names the idea; the idea is marked tried
+    const status = await $.command.run(stress('status') as never)
+    expect(status.text).toContain('#2 held src/cache.ts:LruCache.set: eviction count shown, no slowdown (fix verified) (from idea #1)')
+    expect(status.text).toContain('idea #1 (S) Show the eviction count in the cache stats [tried]')
+    expect(w.toasts.at(-1)).toMatch(/^stress-scout tried idea #1 \(#2 held\)/)
+    // it counted as a run
+    expect(w.statuses.at(-1)).toMatch(/watching · 1\/8 runs/)
+    const pane = await paneOf($)
+    expect(await pane.find({ text: /src\/cache.ts:LruCache.set · concurrency · idea #1/ })).toBeDefined()
+    await pane.unmount()
+
+    // a verified result of an idea still waits for a tap
+    await clock.advance(10 * 60_000)
+    await clock.settle()
+    expect(w.submitted).toHaveLength(0)
+  })
+
+  test('the Try it button does the same as /stress try', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    const pane = await paneOf($)
+    await pane.press({ key: 'try-1' })
+    await clock.settle()
+    await pane.unmount()
+    expect(w.spawned).toHaveLength(1)
+    expect(w.spawned[0]?.input).toContain('idea #1')
+  })
+
+  test('the band leaves an actionable finding to itself; the idea waits in the pane', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.triage = withIdea(IDEA, true)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    // the idea took #1, the test of the risky change #2
+    expect(w.spawned).toHaveLength(1)
+    const band = await bandOf($)
+    expect(await band.find({ text: /stress-scout #2 broke/ })).toBeDefined()
+    expect(await band.findAll({ key: 'try' })).toHaveLength(0)
+    await band.unmount()
+    const pane = await paneOf($)
+    expect(await pane.find({ key: 'try-1' })).toBeDefined()
+    await pane.unmount()
+  })
+
+  test('dismissing an idea takes it out of the pane, the band and the status', { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    const dismissed = await $.command.run(stress('dismiss 1') as never)
+    expect(dismissed.text).toContain('Dismissed idea #1')
+    expect((await $.command.run(stress('status') as never)).text).not.toContain('idea #1')
+    const pane = await paneOf($)
+    expect(await pane.findAll({ key: 'try-1' })).toHaveLength(0)
+    await pane.unmount()
+    const band = await bandOf($)
+    expect(await band.findAll({ key: 'try' })).toHaveLength(0)
+    await band.unmount()
+  })
+
+  /** one scan with an idea for src/cache.ts, in a project that dismissed an idea for that file at `hash` */
+  async function scanWithDismissed($: Engine, on: On, hash: string): Promise<string> {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on, {
+      [`mem:${fnv(ROOT)}`]: {
+        v: 1,
+        lastTree: '',
+        lastSweepAt: 0,
+        nextId: 1,
+        touchedAt: 0,
+        tested: {},
+        dismissed: { 'src/cache.ts|idea': { at: 1, hash } },
+      },
+    })
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    expect(w.triagePrompts).toHaveLength(1)
+    expect(w.triagePrompts[0]).toContain('RECENT EDITS')
+    return (await $.command.run(stress('status') as never)).text ?? ''
+  }
+
+  test('an idea whose code hash was dismissed does not come back', { timeoutMs: 30_000 }, async ($, on) => {
+    expect(await scanWithDismissed($, on, fnv(`src/cache.ts:${BLOB}`))).not.toContain('idea #')
+  })
+
+  test('a dismissed idea returns once its code has changed', { timeoutMs: 30_000 }, async ($, on) => {
+    expect(await scanWithDismissed($, on, '00000000')).toContain('idea #1')
+  })
+
+  test('suggestImprovements off: the question is not asked and nothing is suggested', { timeoutMs: 30_000, options: { suggestImprovements: false } }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    expect(w.triagePrompts).toHaveLength(1)
+    expect(w.triagePrompts[0]).not.toContain('RECENT EDITS')
+    expect((await $.command.run(stress('status') as never)).text).not.toContain('idea #')
+    const pane = await paneOf($)
+    expect(await pane.findAll({ key: 'try-1' })).toHaveLength(0)
+    await pane.unmount()
+  })
+
+  describe('the guardrails drop the idea', () => {
+    const cases: [string, Record<string, unknown>][] = [
+      ['a style-only preference', { type: 'style' }],
+      ['a value under the threshold', { value: 6 }],
+      ['a change bigger than M', { size: 'L' }],
+      ['an idea that edits package.json', { files: ['package.json'] }],
+      ['an idea that edits a lockfile', { files: ['src/cache.ts', 'pnpm-lock.yaml'] }],
+      ['an idea that says to install a package', { title: 'Install lodash and use its LRU in the cache' }],
+      ['an idea that says to add a dependency', { why: 'add a dependency on a stats library' }],
+      ['an idea in a file outside the recent edits', { files: ['src/other.ts'] }],
+      ['an idea that touches one file outside the recent edits', { files: ['src/cache.ts', 'src/other.ts'] }],
+      ['an idea that names no files', { files: [] }],
+    ]
+    for (const [name, patch] of cases) {
+      test(name, { timeoutMs: 30_000 }, async ($, on) => {
+        const clock = mock.clock(on, { now: 1_700_000_000_000 })
+        const w = world(on)
+        // every file the idea names is in the tree and was edited, except src/other.ts
+        w.files = ['src/cache.ts', 'package.json', 'pnpm-lock.yaml']
+        w.triage = withIdea({ ...IDEA, ...patch })
+        await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+        await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+        w.tree = TREE_B
+        await clock.advance(45_000)
+        await clock.settle()
+        expect(w.triagePrompts).toHaveLength(1)
+        expect(w.triagePrompts[0]).toContain('RECENT EDITS')
+        expect((await $.command.run(stress('status') as never)).text).not.toContain('idea #')
+      })
+    }
+  })
+
+  /** two scans, each with an idea for another file */
+  async function twoIdeas($: Engine, on: On): Promise<string> {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.files = ['src/cache.ts', 'src/util.ts']
+    w.triage = withIdea(IDEA)
+    await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+    w.triage = withIdea({ ...IDEA, title: 'Validate the capacity argument', files: ['src/util.ts'] })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/util.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_C
+    await clock.advance(45_000)
+    await clock.settle()
+    expect(w.triagePrompts).toHaveLength(2)
+    return (await $.command.run(stress('status') as never)).text ?? ''
+  }
+
+  test('maxIdeasPerSession caps the ideas shown', { timeoutMs: 30_000, options: { maxIdeasPerSession: 1 } }, async ($, on) => {
+    const status = await twoIdeas($, on)
+    expect(status).toContain('idea #1')
+    expect(status).not.toContain('Validate the capacity argument')
+  })
+
+  test('under the default cap a second idea on another file is shown', { timeoutMs: 30_000 }, async ($, on) => {
+    expect(await twoIdeas($, on)).toContain('idea #2 (S) Validate the capacity argument')
+  })
 })
