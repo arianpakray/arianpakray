@@ -138,6 +138,10 @@ type World = {
   surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
+  /** What `uname -s` answers; '' is a machine with none of the offline tools. */
+  kernel: string
+  /** Whether sandbox-exec or unshare runs here. */
+  hasOffline: boolean
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -163,6 +167,8 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     opened: [],
     surfaces: ['desktop'],
     reports: [],
+    kernel: '',
+    hasOffline: true,
   }
   mock.store(on, stored)
   mock.env(on, place.env)
@@ -183,6 +189,10 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
   on('fs.list', () => ({ value: [] }))
   on('process.run', ($, e) => {
     w.runs.push(e.argv)
+    if (e.argv[0] === 'uname') return ok(`${w.kernel}\n`)
+    if (e.argv[0] === 'sandbox-exec' || e.argv[0] === 'unshare') {
+      return { value: { exitCode: w.hasOffline ? 0 : 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const argv = e.argv.join(' ')
     const index = e.init?.env?.GIT_INDEX_FILE ?? ''
     if (e.argv.some(arg => w.missingTrees.has(arg.replace('^{tree}', '')))) {
@@ -719,4 +729,96 @@ test('a bare /stress and a prompt with empty text pass through', { timeoutMs: 30
   await $.prompt.submit({ text: '', wait: false, origin: { kind: 'composer' } })
   expect(w.submitted).toHaveLength(count + 1)
   expect(w.submitted.at(-1)?.context ?? []).toHaveLength(0)
+})
+
+/** A risky edit, a quiet spell and a tester run in a world of the given kernel; the pane's text and the tester's env. */
+async function runOffline($: Parameters<NonNullable<Parameters<typeof test>[2]>>[0], on: On, kernel: string, hasOffline: boolean, place: Place = POSIX) {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on, {}, place)
+  w.kernel = kernel
+  w.hasOffline = hasOffline
+  await $.session.start({ cwd: place.root, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${place.root}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+  const pane = await $.ui.mount({ plugin: 'stress-scout', surface: 'desktop', component: 'Pane', requestId: 'stress-scout', props: PANE })
+  return { w, pane, mode: w.spawned[0]?.env?.STRESS_SCOUT_OFFLINE }
+}
+
+describe('the tester runs its commands without network', () => {
+  test('macOS wraps them in sandbox-exec', { timeoutMs: 30_000 }, async ($, on) => {
+    const { pane, mode } = await runOffline($, on, 'Darwin', true)
+    expect(mode).toBe('sandbox-exec')
+    expect(await pane.find({ text: /network: off \(sandbox-exec\)/ })).toBeDefined()
+  })
+
+  test('Linux wraps them in unshare', { timeoutMs: 30_000 }, async ($, on) => {
+    const { pane, mode } = await runOffline($, on, 'Linux', true)
+    expect(mode).toBe('unshare')
+    expect(await pane.find({ text: /network: off \(unshare\)/ })).toBeDefined()
+  })
+
+  test('a failed probe leaves the guard alone', { timeoutMs: 30_000 }, async ($, on) => {
+    const { pane, mode } = await runOffline($, on, 'Darwin', false)
+    expect(mode).toBe('')
+    expect(await pane.find({ text: /network: guard only/ })).toBeDefined()
+  })
+
+  test('on Windows nothing is probed', { timeoutMs: 30_000 }, async ($, on) => {
+    const { w, pane, mode } = await runOffline($, on, 'Linux', true, WINDOWS)
+    expect(mode).toBe('')
+    expect(w.runs.some(argv => ['uname', 'sandbox-exec', 'unshare'].includes(argv[0] ?? ''))).toBe(false)
+    expect(await pane.find({ text: /network: guard only/ })).toBeDefined()
+  })
+
+  test('testerOffline off probes nothing', { timeoutMs: 30_000, options: { testerOffline: false } }, async ($, on) => {
+    const { w, mode } = await runOffline($, on, 'Darwin', true)
+    expect(mode).toBe('')
+    expect(w.runs.some(argv => argv[0] === 'sandbox-exec')).toBe(false)
+  })
+
+  /** A tester process told to cut commands off by `how`: the Bash commands that reach the tool, for one the guard passes and one it refuses. */
+  async function testerBash($: Parameters<NonNullable<Parameters<typeof test>[2]>>[0], on: On, how: string, command: string): Promise<string[]> {
+    const run = '/tmp/stress-scout/proj-1234abcd/runs/run-0001-1700000000000'
+    mock.clock(on, { now: 1_700_000_000_000 })
+    mock.env(on, {
+      STRESS_SCOUT_ROLE: 'tester',
+      STRESS_SCOUT_ROOTS: JSON.stringify([ROOT]),
+      STRESS_SCOUT_RUN_DIRS: JSON.stringify([run]),
+      STRESS_SCOUT_HOME: '/Users/dev',
+      STRESS_SCOUT_OFFLINE: how,
+    })
+    on('fs.stat', ($, e) => ({ value: { kind: 'file' as const, size: 0, mtimeMs: 0, isLink: false, realPath: e.path } }))
+    on('session.start', ($, e) => ({ cwd: e.cwd }))
+    const seen: string[] = []
+    on('tool.call', ($, e) => {
+      seen.push(String((e as unknown as { command?: unknown }).command))
+      return { result: 'ok' } as never
+    })
+    await $.session.start({ cwd: `${run}/snapshot`, surface: null, isInteractive: false })
+    await toolCall($, { tool: 'Bash', command })
+    await toolCall($, { tool: 'Bash', command: 'rm -rf /work/proj/src' })
+    return seen
+  }
+
+  const QUOTED = "timeout 120 node -e 'console.log(1)'"
+  // the same command as one single-quoted word: each inner ' closes the quote, escapes itself and reopens it
+  const WRAPPED = "'timeout 120 node -e '\\''console.log(1)'\\'''"
+
+  test('inside the tester, sandbox-exec wraps a Bash call the guard passed, and a refused one never runs', { timeoutMs: 30_000 }, async ($, on) => {
+    const seen = await testerBash($, on, 'sandbox-exec', QUOTED)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatch(/^sandbox-exec -p '\(version 1\)\(allow default\)\(deny network-outbound\)/)
+    expect(seen[0]?.endsWith(` /bin/bash -c ${WRAPPED}`)).toBe(true)
+  })
+
+  test('inside the tester, unshare wraps a Bash call', { timeoutMs: 30_000 }, async ($, on) => {
+    expect(await testerBash($, on, 'unshare', QUOTED)).toEqual([`unshare -rn bash -c ${WRAPPED}`])
+  })
+
+  test('inside the tester with no offline mode, the command is unchanged', { timeoutMs: 30_000 }, async ($, on) => {
+    expect(await testerBash($, on, '', QUOTED)).toEqual([QUOTED])
+  })
 })

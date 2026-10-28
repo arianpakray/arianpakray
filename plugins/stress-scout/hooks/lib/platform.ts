@@ -164,3 +164,38 @@ export async function linkFolder($: EngineInterface, target: string, link: strin
   const script = `New-Item -ItemType Junction -Path ${psQuote(link.replace(/\//g, '\\'))} -Target ${psQuote(target.replace(/\//g, '\\'))} -ErrorAction Stop | Out-Null`
   return (await powershell($, script, 60_000)).exitCode === 0
 }
+
+/** How the tester's shell commands are cut off from the network; '' leaves the guard alone. */
+export type Offline = 'sandbox-exec' | 'unshare' | ''
+
+/** macOS: everything but outbound network, except loopback and local sockets so a test can still talk to a server it starts. */
+export const NO_NETWORK_PROFILE =
+  '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote unix-socket))(allow network-outbound (remote ip "localhost:*"))'
+
+/** `text` as one single-quoted shell word. */
+export const shQuote = (text: string): string => `'${text.replace(/'/g, "'\\''")}'`
+
+/**
+ * Which tool can run a command without network here, found by trying it: macOS
+ * `sandbox-exec`, Linux `unshare -rn` (an unprivileged network namespace).
+ * Windows has neither, so it stays ''.
+ */
+export async function probeOffline($: EngineInterface, isWindows: boolean): Promise<Offline> {
+  if (isWindows) return ''
+  const kernel = (await $.process.run(['uname', '-s'], { timeoutMs: 10_000 }).catch(() => undefined))?.stdout.trim()
+  const argv =
+    kernel === 'Darwin'
+      ? ['sandbox-exec', '-p', NO_NETWORK_PROFILE, '/usr/bin/true']
+      : kernel === 'Linux'
+        ? ['unshare', '-rn', 'true']
+        : undefined
+  if (argv === undefined) return ''
+  const probe = await $.process.run(argv, { timeoutMs: 10_000 }).catch(() => undefined)
+  return probe?.exitCode === 0 ? (kernel === 'Darwin' ? 'sandbox-exec' : 'unshare') : ''
+}
+
+/** `command` run under bash with the network cut off by `how`. */
+export const offlineCommand = (how: Exclude<Offline, ''>, command: string): string =>
+  how === 'sandbox-exec'
+    ? `sandbox-exec -p ${shQuote(NO_NETWORK_PROFILE)} /bin/bash -c ${shQuote(command)}`
+    : `unshare -rn bash -c ${shQuote(command)}`
