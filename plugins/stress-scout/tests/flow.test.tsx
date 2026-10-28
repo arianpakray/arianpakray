@@ -595,7 +595,8 @@ test('pressing Apply again while Claude is busy does not queue the prompt twice'
 
 test('a finding left mid-handoff by a reload can be applied again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
   const { clock, w } = await verifiedFix($, on)
-  w.submitGate = new Promise<void>(() => {})
+  let release = () => {}
+  w.submitGate = new Promise<void>(resolve => (release = resolve))
   expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
   await clock.settle()
   expect((await $.command.run(stress('status') as never)).text).toContain('[handing]')
@@ -605,6 +606,8 @@ test('a finding left mid-handoff by a reload can be applied again', { timeoutMs:
   await clock.settle()
   expect((await $.command.run(stress('status') as never)).text).not.toContain('[handing]')
   expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+  release()
+  await clock.settle()
 })
 
 test('a handoff that fails leaves the finding ready to apply again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
