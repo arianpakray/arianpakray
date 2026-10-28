@@ -44,6 +44,7 @@ import {
   patchOf,
   type Shadow,
 } from './lib/shadow'
+import { homeFolder, isWindowsPath, portable, removeTree, tempRoot, windowsCanonical } from './lib/platform'
 import { ago, basename, clip, clockTime, compactTokens, fnv, isInside, oneLine, slug, trimSlash } from './lib/util'
 
 type $ = EngineInterface
@@ -86,6 +87,8 @@ type Config = {
 
 type Ctx = {
   root: string
+  /** The project is on Windows: paths compare in any case, folders link as junctions. */
+  isWindows: boolean
   home: string
   scratch: string
   shadow: Shadow
@@ -169,14 +172,21 @@ const memoryKeyOf = (c: Ctx): string => `mem:${c.projectKey}`
 const listOf = (json: string | undefined): string[] => {
   try {
     const value: unknown = JSON.parse(json ?? '[]')
-    return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string' && v.startsWith('/')) : []
+    return Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string' && isAbsolutePath(v)) : []
   } catch {
     return []
   }
 }
 
 /** A snapshot folder is never a project of its own: no scout runs inside one. */
-const isSnapshotPath = (path: string): boolean => /\/stress-scout\/[^/]+\/runs\/run-\d+-\d+(\/|$)/.test(path)
+const isSnapshotPath = (path: string): boolean => /[\\/]stress-scout[\\/][^\\/]+[\\/]runs[\\/]run-\d+-\d+([\\/]|$)/.test(path)
+
+/** An absolute path, POSIX or Windows (`C:\` or `C:/`; a `\\` network path counts too). */
+const isAbsolutePath = (path: string): boolean => path.startsWith('/') || isWindowsPath(path)
+
+/** Whether `path` is `dir` or inside it, comparing as the platform does (Windows ignores case and the separator). */
+const isWithin = (path: string, dir: string, isWindows: boolean): boolean =>
+  isWindows ? isInside(windowsCanonical(path), windowsCanonical(dir)) : isInside(path, dir)
 
 // ---- bookkeeping ---------------------------------------------------------------
 
@@ -219,8 +229,10 @@ async function ensureCtx($: $): Promise<Ctx | undefined> {
   if (live.ctxError !== '' && now - live.ctxTriedAt < 10 * 60_000) return undefined
   live.ctxTriedAt = now
   try {
-    const home = trimSlash((await $.env.get('HOME')) ?? '')
-    if (root === '/' || root === '' || root === home) {
+    const home = await homeFolder($)
+    const isWindows = isWindowsPath(root)
+    const isRootFolder = root === '' || root === '/' || /^[A-Za-z]:[\\/]?$/.test(root)
+    if (isRootFolder || (home !== '' && isWithin(home, root, isWindows))) {
       live.ctxError = 'this session runs in your home folder; start Claude Code in a project'
       return undefined
     }
@@ -233,19 +245,20 @@ async function ensureCtx($: $): Promise<Ctx | undefined> {
       live.ctxError = 'git is not installed'
       return undefined
     }
-    const tmp = trimSlash((await $.env.get('TMPDIR')) || '/tmp')
+    const tmp = await tempRoot($, isWindows)
     const projectKey = fnv(root)
     const given = `${tmp}/stress-scout/${slug(basename(root))}-${projectKey}`
     await $.fs.write(`${given}/.keep`, '')
     const scratch = trimSlash((await $.fs.stat(given, { resolve: true })).realPath ?? given)
     const rootReal = trimSlash((await $.fs.stat(root, { resolve: true })).realPath ?? root)
-    if (isInside(scratch, root) || isInside(scratch, rootReal)) {
-      live.ctxError = 'TMPDIR is inside the project; point TMPDIR elsewhere'
+    if (isWithin(scratch, root, isWindows) || isWithin(scratch, rootReal, isWindows)) {
+      live.ctxError = `${isWindows ? 'TEMP' : 'TMPDIR'} is inside the project; point it elsewhere`
       return undefined
     }
     const shadow = await openShadow($, root, scratch)
     live.ctx = {
       root,
+      isWindows,
       home,
       scratch,
       shadow,
@@ -316,21 +329,34 @@ async function loadSandbox($: $): Promise<Sandbox | undefined> {
   return roots.length > 0 && runDirs.length > 0 ? { roots, runDirs, home } : undefined
 }
 
-/** Where a file path lands once links resolve, walking up to the nearest folder that exists. */
+/**
+ * Where a file path lands once links resolve, walking up to the nearest folder
+ * that exists. Undefined for what the spelling alone can't place: a relative
+ * path, `.` or `..`, a drive-relative `C:x`, a `\\` network or device path, a
+ * `file:stream` alternate data stream.
+ */
 async function placed($: $, path: string): Promise<string | undefined> {
-  if (!path.startsWith('/') || /(^|\/)\.\.?(\/|$)/.test(path)) return undefined
+  const isPlaceable =
+    isAbsolutePath(path) &&
+    !/^[\\/]{2}/.test(path) &&
+    !/(^|[\\/])\.\.?([\\/]|$)/.test(path) &&
+    !(isWindowsPath(path) && /^[A-Za-z]:[^:]*:/.test(path))
+  if (!isPlaceable) return undefined
   const own = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
   if (own?.realPath !== undefined) return own.realPath
   let dir = trimSlash(path)
   let rest = ''
-  while (dir.includes('/')) {
-    const cut = dir.lastIndexOf('/')
+  for (;;) {
+    const cut = Math.max(dir.lastIndexOf('/'), dir.lastIndexOf('\\'))
+    if (cut < 0) return undefined
     rest = rest === '' ? dir.slice(cut + 1) : `${dir.slice(cut + 1)}/${rest}`
     dir = dir.slice(0, cut)
-    const stat = await $.fs.stat(dir === '' ? '/' : dir, { resolve: true }).catch(() => undefined)
+    // a root keeps its separator: `C:` alone is wherever drive C: last was
+    const folder = dir === '' ? '/' : /^[A-Za-z]:$/.test(dir) ? `${dir}\\` : dir
+    const stat = await $.fs.stat(folder, { resolve: true }).catch(() => undefined)
     if (stat?.realPath !== undefined) return `${trimSlash(stat.realPath)}/${rest}`
+    if (folder === '/' || /^[A-Za-z]:\\$/.test(folder)) return undefined
   }
-  return undefined
 }
 
 /** The guard's verdict on one of the tester's calls, by tool. */
@@ -347,7 +373,7 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
       return checkBash(text('command'), box)
     case 'Read': {
       const path = text('file_path')
-      const real = path.startsWith('/') ? (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath : undefined
+      const real = isAbsolutePath(path) ? (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath : undefined
       return checkRead(path, box, real)
     }
     case 'Write':
@@ -468,6 +494,9 @@ const sandboxOf = (c: Ctx, run: Run): Sandbox => ({
   home: c.home,
 })
 
+const tempEnv = (dir: string, isWindows: boolean): Record<string, string> =>
+  isWindows ? { TMPDIR: dir, TEMP: dir, TMP: dir } : { TMPDIR: dir }
+
 /** The headless tester's command line: few tools, no MCP, no skills, a budget, the guard loaded. */
 function testerArgv($: $, exec: string, run: Run): string[] {
   const { testerModel, maxDollarsPerRun } = live.config
@@ -502,7 +531,8 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
     STRESS_SCOUT_ROOTS: JSON.stringify(box.roots),
     STRESS_SCOUT_RUN_DIRS: JSON.stringify(box.runDirs),
     STRESS_SCOUT_HOME: box.home,
-    TMPDIR: `${run.runDir}/tmp`,
+    // Windows programs read TEMP and TMP; Git Bash and the rest read TMPDIR
+    ...tempEnv(c.isWindows ? portable(`${run.runDir}/tmp`) : `${run.runDir}/tmp`, c.isWindows),
   }
   let result: TesterResult | undefined
   let steps = 0
@@ -618,10 +648,11 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     plan: args.plan,
     intent: args.intent,
     diff: args.diff,
-    snapshot,
-    runDir,
-    root: c.root,
+    snapshot: c.isWindows ? portable(snapshot) : snapshot,
+    runDir: c.isWindows ? portable(runDir) : runDir,
+    root: c.isWindows ? portable(c.root) : c.root,
     linkedDeps: linked,
+    isWindows: c.isWindows,
   })
   void superviseTester($, c, run, prompt)
 }
@@ -758,7 +789,7 @@ async function cleanupRuns($: $, c: Ctx): Promise<void> {
     .reverse()
   for (const name of names.slice(KEEP_RUNS)) {
     const path = `${dir}/${name}`
-    if (active?.runDir !== path) await $.process.run(['rm', '-rf', path], { timeoutMs: 120_000 }).catch(() => undefined)
+    if (active?.runDir !== path) await removeTree($, path, c.isWindows, 120_000).catch(() => undefined)
   }
 }
 
