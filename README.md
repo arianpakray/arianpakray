@@ -25,9 +25,13 @@ From a shell:
 claude plugin install stress-scout --marketplace arianpakray/arianpakray
 ```
 
-This repository is private, so the machine needs GitHub access to it (for example `gh auth login`, then `gh auth setup-git`).
+This repository is private, so the machine needs GitHub access to it (for example `gh auth login`, then `gh auth setup-git`). On Windows, the simplest way is to run this once in PowerShell. Git Credential Manager opens a browser to sign you in and remembers it:
 
-It needs `git` and runs on macOS and Linux; Windows is untested. The tester is started with the running Claude Code's own binary. If a run reports that it couldn't start the tester, set **Path to the claude binary** under stress-scout in `/config`.
+```
+git ls-remote https://github.com/arianpakray/arianpakray.git
+```
+
+It needs `git`, and runs on macOS, Linux and Windows 10 or later (with Git for Windows, which Claude Code needs there anyway). The tester is started with the running Claude Code's own binary. If a run reports that it couldn't start the tester, set **Path to the claude binary** under stress-scout in `/config`.
 
 ## Use
 
@@ -60,7 +64,13 @@ The tester is a separate headless Claude Code process:
 - It runs with `--permission-mode dontAsk`, so any call the stress-scout guard doesn't approve is refused.
 - The guard allows writes only inside the run folder and never lets the tester touch or name your real project, including through the snapshot's links to your `node_modules` or `.venv`. It also blocks reading secrets (`.env`, `~/.ssh`, credentials, however the path is spelled or globbed), network access beyond localhost, global installs, history-changing git commands and `sudo`.
 
-The guard is a seatbelt, not a security boundary. For OS-level isolation, also turn on Claude Code's sandbox (`/sandbox`). Scratch data (snapshots and a shadow git index) lives in `$TMPDIR/stress-scout/`. Nothing in your repository's `.git` is created or changed; git only refreshes the timestamps of objects the shadow index reuses from it.
+The guard is a seatbelt, not a security boundary. For OS-level isolation, also turn on Claude Code's sandbox (`/sandbox`). Scratch data (snapshots and a shadow git index) lives in `$TMPDIR/stress-scout/` (`%TEMP%\stress-scout\` on Windows). Nothing in your repository's `.git` is created or changed; git only refreshes the timestamps of objects the shadow index reuses from it.
+
+## Windows
+
+- The tester's Bash tool is Git Bash. The guard reads every way Windows and Git Bash spell a path (`C:\Users\…`, `C:/Users/…`, `/c/Users/…`) in any letter case. Inside the sandbox, `cmd`, PowerShell and system tools such as `reg` and `schtasks` are refused.
+- Dependency folders are linked into a snapshot as directory junctions, which need no admin rights. Old runs are deleted by a routine that removes a junction without entering it, so your real `node_modules` is never touched.
+- Windows Defender scans each file of a new snapshot, which can make a run slow to start on a big project. If that bothers you, you can exclude `%TEMP%\stress-scout` from real-time scanning; that folder only holds copies of your own code.
 
 ## Develop
 
@@ -68,4 +78,7 @@ The guard is a seatbelt, not a security boundary. For OS-level isolation, also t
 claude plugin validate plugins/stress-scout
 claude plugin test plugins/stress-scout
 claude --plugin-dir plugins/stress-scout
+bun ci/real-fs.ts    # the file system and git work on this machine, links and deletes included
 ```
+
+CI runs the validate, test and `ci/real-fs.ts` steps on Ubuntu and Windows.

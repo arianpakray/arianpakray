@@ -9,6 +9,7 @@
  */
 import type { EngineInterface, ProcessRunResult } from 'claude-code'
 
+import { isWindowsPath, linkFolder, removeTree } from './platform'
 import { parseChurn, parseLsTree, type TreeFile } from './rank'
 import { exclusive } from './util'
 
@@ -139,6 +140,8 @@ export type Shadow = {
   index: string
   /** Whether the project is itself a git repository (its objects are alternates). */
   isProjectGit: boolean
+  /** Whether the project is on Windows: folders are linked as junctions and deleted through PowerShell. */
+  isWindows: boolean
 }
 
 type GitOptions = { workTree?: string; index?: string; timeoutMs?: number; isTolerant?: boolean }
@@ -163,6 +166,8 @@ async function git(
       '-c', 'core.safecrlf=false',
       '-c', 'advice.addEmbeddedRepo=false',
       '-c', 'gc.auto=0',
+      '-c', 'core.longpaths=true',
+      '-c', 'core.fsmonitor=false',
       ...args,
     ],
     {
@@ -205,7 +210,7 @@ async function openShadowNow($: EngineInterface, root: string, scratch: string):
   const gitDir = `${scratch}/shadow.git`
   const common = await projectGit($, root, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
   const isProjectGit = common.exitCode === 0 && common.stdout.trim() !== ''
-  const shadow: Shadow = { root, scratch, gitDir, index: `${scratch}/shadow.index`, isProjectGit }
+  const shadow: Shadow = { root, scratch, gitDir, index: `${scratch}/shadow.index`, isProjectGit, isWindows: isWindowsPath(root) }
   if (!(await $.fs.exists(`${gitDir}/HEAD`))) {
     const init = await $.process.run(['git', 'init', '-q', '--bare', gitDir], { timeoutMs: 30_000 })
     if (init.exitCode !== 0) throw new GitError(`git init failed: ${init.stderr.trim().slice(0, 300)}`)
@@ -218,7 +223,7 @@ async function openShadowNow($: EngineInterface, root: string, scratch: string):
 /** Forgets the shadow's index, its lock and its objects, for when they no longer match the project. */
 async function resetShadowNow($: EngineInterface, shadow: Shadow): Promise<void> {
   for (const path of [shadow.gitDir, shadow.index, `${shadow.index}.lock`]) {
-    if (path.startsWith(`${shadow.scratch}/`)) await $.process.run(['rm', '-rf', path], { timeoutMs: 60_000 })
+    if (path.startsWith(`${shadow.scratch}/`)) await removeTree($, path, shadow.isWindows, 60_000)
   }
 }
 
@@ -259,7 +264,7 @@ async function removeStaleLock($: EngineInterface, shadow: Shadow): Promise<bool
   const lock = `${shadow.index}.lock`
   const stat = await $.fs.stat(lock).catch(() => undefined)
   if (stat === undefined || (await $.clock.now()) - stat.mtimeMs < STALE_LOCK_MS) return false
-  return (await $.process.run(['rm', '-f', lock])).exitCode === 0
+  return removeTree($, lock, shadow.isWindows, 30_000)
 }
 
 /** Whether the shadow holds `tree`; one remembered from before the shadow was rebuilt is gone. */
@@ -307,7 +312,11 @@ export async function churn($: EngineInterface, shadow: Shadow): Promise<Map<str
   return log.exitCode === 0 ? parseChurn(log.stdout) : new Map()
 }
 
-/** Writes `tree` out as a disposable copy under `runDir`, its ignored dependency folders linked. */
+/**
+ * Writes `tree` out as a disposable copy under `runDir`, its ignored
+ * dependency folders linked. Git checks the tree out itself (no tar), into
+ * the snapshot's own index, which patchOf then reads the tester's fix from.
+ */
 export async function makeSnapshot(
   $: EngineInterface,
   shadow: Shadow,
@@ -315,18 +324,15 @@ export async function makeSnapshot(
   runDir: string,
 ): Promise<{ snapshot: string; linked: string[] }> {
   const snapshot = snapshotOf(runDir)
-  const tar = `${runDir}/snapshot.tar`
   await $.fs.write(`${runDir}/tmp/.keep`, '')
   await $.fs.write(`${snapshot}/.stress-scout/.keep`, '')
-  await git($, shadow, ['archive', '--format=tar', '-o', tar, tree], { timeoutMs: 180_000 })
-  const untar = await $.process.run(['tar', '-xf', tar, '-C', snapshot], { timeoutMs: 180_000 })
-  if (untar.exitCode !== 0) throw new GitError(`tar failed: ${untar.stderr.trim().slice(0, 300)}`)
-  await $.process.run(['rm', '-f', tar])
+  const options = { workTree: snapshot, index: `${runDir}/snapshot.index`, timeoutMs: 180_000 }
+  await git($, shadow, ['read-tree', tree], options)
+  await git($, shadow, ['checkout-index', '--all', '--force', '-u'], options)
   const linked: string[] = []
   for (const dir of DEP_DIRS) {
     if ((await $.fs.exists(`${shadow.root}/${dir}`)) && !(await $.fs.exists(`${snapshot}/${dir}`))) {
-      const link = await $.process.run(['ln', '-s', `${shadow.root}/${dir}`, `${snapshot}/${dir}`])
-      if (link.exitCode === 0) linked.push(dir)
+      if (await linkFolder($, `${shadow.root}/${dir}`, `${snapshot}/${dir}`, shadow.isWindows)) linked.push(dir)
     }
   }
   return { snapshot, linked }
