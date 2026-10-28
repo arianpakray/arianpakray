@@ -3,7 +3,7 @@ import type { IdeaDraft } from './report'
 /** The value (0-10) an idea must reach; the prompt tells the model most moments deserve under 5. */
 export const IDEA_MIN_VALUE = 8
 
-const MANIFESTS =
+export const MANIFESTS =
   /(^|\/)(package(-lock)?\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|requirements[^/]*\.(txt|in)|Pipfile(\.lock)?|poetry\.lock|pyproject\.toml|Cargo\.(toml|lock)|go\.(mod|sum)|Gemfile(\.lock)?|composer\.(json|lock))$/i
 
 const INSTALLS =
