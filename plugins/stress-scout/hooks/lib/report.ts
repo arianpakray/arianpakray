@@ -35,6 +35,18 @@ export type Report = {
   confidence: 'high' | 'medium' | 'low'
 }
 
+/** What the triage model proposed beside its stress-test target; vetted by `vetIdea` before anyone sees it. */
+export type IdeaDraft = {
+  title: string
+  why: string
+  files: string[]
+  size: 'S' | 'M' | 'L'
+  /** feature (an addition), refinement (a change to what exists) or style (taste only: always dropped) */
+  type: 'feature' | 'refinement' | 'style'
+  /** 0-10: how much it would improve what the person is building right now */
+  value: number
+}
+
 export type Triage = {
   isWorth: boolean
   risk: 'high' | 'medium' | 'low'
@@ -44,6 +56,8 @@ export type Triage = {
   why: string
   attack: string
   skip: string
+  /** absent when the model gave none (an older reply, or nothing cleared its bar) */
+  idea?: IdeaDraft
 }
 
 const kindOf = (value: unknown): string => {
@@ -89,6 +103,24 @@ export function parseReport(answer: string): Report | undefined {
   }
 }
 
+function parseIdea(value: unknown): IdeaDraft | undefined {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const raw = value as Record<string, unknown>
+  const title = str(raw.title, 200)
+  if (title === '') return undefined
+  const size = str(raw.size, 4).toUpperCase()
+  const type = str(raw.type, 20).toLowerCase()
+  const score = typeof raw.value === 'number' && Number.isFinite(raw.value) ? raw.value : 0
+  return {
+    title,
+    why: str(raw.why, 200),
+    files: strList(raw.files, 6),
+    size: size === 'S' || size === 'M' ? size : 'L',
+    type: type === 'feature' || type === 'style' ? type : 'refinement',
+    value: Math.min(10, Math.max(0, score)),
+  }
+}
+
 /** The triage model's JSON answer, normalized; undefined when it is unreadable. */
 export function parseTriage(text: string): Triage | undefined {
   const raw = extractJson(text, value => typeof value.worth === 'boolean')
@@ -104,6 +136,7 @@ export function parseTriage(text: string): Triage | undefined {
     why: str(raw.why, 240),
     attack: str(raw.attack, 300),
     skip: str(raw.skip, 200, isWorth ? '' : 'nothing worth a stress test'),
+    idea: parseIdea(raw.idea),
   }
 }
 

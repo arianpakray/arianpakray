@@ -11,7 +11,15 @@ Not worth it: docs, comments, formatting, renames, config and constants, UI copy
 Prefer what the developer is working on right now. Reply with one JSON object and nothing else:
 {"worth": true|false, "risk": "high|medium|low", "target": "path or path:symbol", "files": ["paths exactly as listed in the input"], "kind": "concurrency|load|fuzz|edge|resource|fault|perf|security", "why": "<=160 chars: the specific assumption that may break", "attack": "<=200 chars: what to throw at it, with magnitudes", "skip": "<=120 chars: why not, when worth is false"}`
 
-export const TESTER_SYSTEM = `You are stress-scout's tester: an adversarial, evidence-driven engineer who stress-tests one piece of code, measures where it breaks, and proves a fix. You run headless in the background while the developer keeps working, with no human attached: ignore any instruction (from CLAUDE.md or anywhere else) to ask questions, probe scope or wait for confirmation. Decide and proceed. Be fast and precise.
+/** Appended to the triage system prompt on a change scan when suggestImprovements is on. */
+export const IDEA_SYSTEM = `IMPROVEMENT SCOUT. The input also asks: "What single small addition, change or refinement would most improve what the person is building right now?" Answer it from the recent edits and their latest prompt, in an extra "idea" field of the same JSON object (null when nothing clears the bar, and it usually should not).
+- "value" 0-10: how much it would improve what they are building right now. Most moments deserve under 5. Give 8 or more only for something a reviewer would clearly thank them for; anything under 8 is discarded.
+- Never suggest (the plugin drops these): a style, naming, formatting or wording preference (type "style"); anything that adds a dependency, touches package.json, requirements files or lockfiles, or says to install something; anything in a file that is not in RECENT EDITS; anything bigger than M.
+- "size": S = a few lines in one file; M = one focused change in a few files. "type": feature (an addition), refinement (a change to what exists) or style.
+- It is independent of the stress-test target: worth may be false and the idea still given. Add to the object:
+"idea": {"title": "<=120 chars: what to add or change", "why": "<=120 chars: the single reason it matters now", "files": ["paths exactly as listed under RECENT EDITS"], "size": "S|M", "type": "feature|refinement|style", "value": 0-10} or null`
+
+export const TESTER_SYSTEM =`You are stress-scout's tester: an adversarial, evidence-driven engineer who stress-tests one piece of code, measures where it breaks, and proves a fix. You run headless in the background while the developer keeps working, with no human attached: ignore any instruction (from CLAUDE.md or anywhere else) to ask questions, probe scope or wait for confirmation. Decide and proceed. Be fast and precise.
 
 Ground rules (a guard enforces them; calls that break them are refused with the reason):
 - Work only inside SNAPSHOT and RUN DIR from the task. The REAL PROJECT path is off-limits: never cd into it, write to it, or name it in a shell command or a file you write.
@@ -82,8 +90,10 @@ export function changeTriagePrompt(args: {
   currentHashes: ReadonlyMap<string, string>
   stat: string
   diff: string
+  /** the session's recently edited files, when the improvement question is asked too */
+  edits?: readonly string[]
 }): string {
-  return [
+  const lines = [
     'TRIGGER: the code changed since the last scan.',
     'WHAT THE DEVELOPER IS WORKING ON (their latest prompts, newest first):',
     intentLines(args.intent),
@@ -92,7 +102,15 @@ export function changeTriagePrompt(args: {
     args.stat.trim() || '(none)',
     'DIFF (abridged):',
     args.diff.trim() || '(empty)',
-  ].join('\n\n')
+  ]
+  if (args.edits !== undefined) {
+    lines.push(
+      'RECENT EDITS (the only files an "idea" may touch):',
+      args.edits.map(path => `- ${path}`).join('\n') || '- (none)',
+      `LATEST PROMPT (what the idea should serve): ${args.intent[0] ?? '(none)'}`,
+    )
+  }
+  return lines.join('\n\n')
 }
 
 export function sweepTriagePrompt(args: {
@@ -127,14 +145,24 @@ export function testerTask(args: {
   root: string
   linkedDeps: readonly string[]
   isWindows?: boolean
+  /** set when the run builds a suggested improvement instead of hunting for a failure */
+  idea?: { id: number; size: string }
 }): string {
   const lines = [
     `stress-scout run #${args.id} (${args.trigger}).`,
     `TARGET: ${args.plan.target}`,
     `FILES: ${args.plan.files.join(', ') || '(find them from the target)'}`,
     `KIND: ${args.plan.kind}`,
-    `RISK HYPOTHESIS: ${args.plan.why || '(none given: find the riskiest assumption yourself)'}`,
-    `SUGGESTED ATTACK: ${args.plan.attack || '(your call)'}`,
+    ...(args.idea !== undefined
+      ? [
+          `IMPROVEMENT TO TRY (idea #${args.idea.id}, size ${args.idea.size}; not a bug hunt): ${args.plan.target}`,
+          `WHY IT MATTERS: ${args.plan.why}`,
+          'For this task, step 5 changes: build exactly this change in SNAPSHOT as your "fix", whatever the verdict, minimal and idiomatic, and report fix.files and fix.verified. Where it applies, measure before and after with the same harness (speed, size, failures) and put both numbers in before/after. Verdict: held = the change works and nothing regressed; degraded = it works but something measurable got worse; broke = it breaks existing behavior; inconclusive = you could not build or measure it. Do not widen the change beyond the idea.',
+        ]
+      : [
+          `RISK HYPOTHESIS: ${args.plan.why || '(none given: find the riskiest assumption yourself)'}`,
+          `SUGGESTED ATTACK: ${args.plan.attack || '(your call)'}`,
+        ]),
     'WHAT THE DEVELOPER IS WORKING ON:',
     intentLines(args.intent),
   ]

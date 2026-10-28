@@ -1,7 +1,8 @@
 import { expect, test } from 'claude-code/testing'
 
 import { isSource, parseChurn, parseLsTree, rankCandidates } from '../hooks/lib/rank'
-import { parseReport, parseTriage } from '../hooks/lib/report'
+import { vetIdea } from '../hooks/lib/ideas'
+import { parseReport, parseTriage, type IdeaDraft } from '../hooks/lib/report'
 import { extractJson } from '../hooks/lib/util'
 
 const REPORT = {
@@ -85,4 +86,47 @@ test('sweeps rank risky source and skip tests, docs, generated and already-teste
   expect(paths.indexOf('src/payments/ledger.ts')).toBeLessThan(paths.indexOf('src/ui/Button.tsx'))
   expect(isSource('src/server.go')).toBe(true)
   expect(isSource('src/server_test.go')).toBe(false)
+})
+
+const TRIAGE = { worth: false, risk: 'low', target: 'src/a.ts', files: ['src/a.ts'], kind: 'edge' }
+const IDEA = { title: 'Show the count', why: 'no visibility', files: ['src/a.ts'], size: 's', type: 'feature', value: 9 }
+
+test('a triage answer without an idea parses as before', () => {
+  const plan = parseTriage(JSON.stringify(TRIAGE))
+  expect(plan?.target).toBe('src/a.ts')
+  expect(plan?.idea).toBeUndefined()
+  expect(parseTriage(JSON.stringify({ ...TRIAGE, idea: null }))?.idea).toBeUndefined()
+  expect(parseTriage(JSON.stringify({ ...TRIAGE, idea: { why: 'no title' } }))?.idea).toBeUndefined()
+})
+
+test('an idea is read and normalized', () => {
+  expect(parseTriage(JSON.stringify({ ...TRIAGE, idea: IDEA }))?.idea).toEqual({
+    title: 'Show the count',
+    why: 'no visibility',
+    files: ['src/a.ts'],
+    size: 'S',
+    type: 'feature',
+    value: 9,
+  })
+  const odd = parseTriage(JSON.stringify({ ...TRIAGE, idea: { title: 't', size: 'huge', type: 'whim', value: 99 } }))?.idea
+  expect(odd).toMatchObject({ size: 'L', type: 'refinement', value: 10, files: [] })
+  expect(parseTriage(JSON.stringify({ ...TRIAGE, idea: { title: 't', value: 'high' } }))?.idea?.value).toBe(0)
+})
+
+test('vetIdea keeps a small valuable idea in recent edits and drops the rest', () => {
+  const draft = (patch: Partial<IdeaDraft>): IdeaDraft => ({ title: 'Show the count', why: 'no visibility', files: ['src/a.ts'], size: 'S', type: 'feature', value: 9, ...patch })
+  const edits = ['src/a.ts', 'package.json']
+  expect(vetIdea(draft({}), edits)).toEqual({ isOk: true })
+  expect(vetIdea(draft({ size: 'M', value: 8 }), edits).isOk).toBe(true)
+  expect(vetIdea(draft({ value: 7 }), edits).isOk).toBe(false)
+  expect(vetIdea(draft({ size: 'L' }), edits).isOk).toBe(false)
+  expect(vetIdea(draft({ type: 'style' }), edits).isOk).toBe(false)
+  expect(vetIdea(draft({ files: [] }), edits).isOk).toBe(false)
+  expect(vetIdea(draft({ files: ['src/b.ts'] }), edits)).toEqual({ isOk: false, reason: 'touches files outside the recent edits' })
+  for (const file of ['package.json', 'web/package-lock.json', 'requirements-dev.txt', 'yarn.lock', 'Cargo.toml', 'go.sum']) {
+    expect(vetIdea(draft({ files: [file] }), [file])).toEqual({ isOk: false, reason: 'adds a dependency' })
+  }
+  expect(vetIdea(draft({ title: 'Install lodash for the cache' }), edits).isOk).toBe(false)
+  expect(vetIdea(draft({ why: 'run npm install zod first' }), edits).isOk).toBe(false)
+  expect(vetIdea(draft({ title: 'Add a dependency on zod' }), edits).isOk).toBe(false)
 })
