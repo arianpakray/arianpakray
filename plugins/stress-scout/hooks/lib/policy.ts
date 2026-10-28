@@ -352,6 +352,14 @@ function segmentsOf(command: string): Segment[] {
       current += char
       continue
     }
+    if (char === '$' && command[i + 1] === "'") {
+      // $'..' honours \' inside, so `$'\'';` ends the string before the `;`
+      let end = i + 2
+      while (end < command.length && command[end] !== "'") end += command[end] === '\\' ? 2 : 1
+      current += command.slice(i, end + 1)
+      i = end
+      continue
+    }
     if (char === '"' || char === "'") {
       quote = char
       current += char
@@ -491,6 +499,12 @@ export function commandOf(tokens: readonly Token[]): { word: string; args: strin
       while (i < words.length && /^(-|\d+$)/.test(words[i] ?? '')) i++
       continue
     }
+    if (name === 'xargs') {
+      // `xargs -I {} git push {}` runs git: step past its flags, and the value of those that take one
+      i++
+      while (i < words.length && (words[i] ?? '').startsWith('-')) i += /^-[IdEaLnPs]$/.test(words[i] ?? '') ? 2 : 1
+      continue
+    }
     if (name === 'timeout') {
       i++
       while (i < words.length && (words[i] ?? '').startsWith('-')) {
@@ -616,9 +630,66 @@ export function checkBash(command: string, sandbox: Sandbox, depth = 0): Check {
   return bashCheck(command, boxOf(sandbox), depth)
 }
 
+/** Bodies of `$(...)`, `<(...)`, `>(...)` and backtick substitutions that run, outermost first; none inside single quotes. */
+function substitutionsOf(text: string): string[] {
+  const found: string[] = []
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i] ?? ''
+    if (char === '\\' && quote !== "'") {
+      i++
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'") quote = ''
+      continue
+    }
+    if (char === '$' && text[i + 1] === "'" && quote === '') {
+      // $'..' honours \' inside
+      i += 2
+      while (i < text.length && text[i] !== "'") i += text[i] === '\\' ? 2 : 1
+    } else if (char === "'" && quote === '') quote = "'"
+    else if (char === '"') quote = quote === '"' ? '' : '"'
+    else if (char === '`') {
+      let end = i + 1
+      while (end < text.length && text[end] !== '`') end += text[end] === '\\' ? 2 : 1
+      // inside backticks \` \$ and \\ are escapes of the outer level
+      found.push(text.slice(i + 1, end).replace(/\\([`$\\])/g, '$1'))
+      i = end
+    } else if (text[i + 1] === '(' && (char === '$' || (quote === '' && (char === '<' || char === '>')))) {
+      // `$((..))` is arithmetic only when it parses as such, else bash runs a subshell: its body is checked too
+      let level = 0
+      let end = i + 1
+      // the quote the body is inside: ' and " as in the shell, $ for $'..', where \' escapes
+      let inner = ''
+      for (; end < text.length; end++) {
+        const c = text[end] ?? ''
+        if (inner !== '') {
+          if (c === '\\' && inner !== "'") end++
+          else if (c === "'" && inner === '$') inner = ''
+          else if (c === inner) inner = ''
+        } else if (c === '\\') end++
+        else if (c === '$' && text[end + 1] === "'") {
+          inner = '$'
+          end++
+        } else if (c === "'" || c === '"') inner = c
+        else if (c === '(') level++
+        else if (c === ')' && --level === 0) break
+      }
+      found.push(text.slice(i + 2, end))
+      i = end
+    }
+  }
+  return found
+}
+
 function bashCheck(command: string, box: Box, depth: number): Check {
   if (depth > 3) return deny('command nests too deeply to check')
   const text = stripDataHeredocs(command)
+  for (const body of substitutionsOf(text)) {
+    const nested = bashCheck(body, box, depth + 1)
+    if (!nested.isAllowed) return nested
+  }
   const word = '(?:^|[\\s;&|(`])'
 
   if (new RegExp(`${word}(sudo|doas|su)(\\s|$)`).test(text)) return deny('no sudo, doas or su')
