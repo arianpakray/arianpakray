@@ -160,6 +160,23 @@ write(readOnly, 'x')
 Bun.spawnSync(isWindows ? ['attrib', '+R', readOnly] : ['chmod', '444', readOnly])
 check('a tree holding a read-only file deletes', (await removeTree($, join(base, 'ro'), isWindows)) && !existsSync(join(base, 'ro')))
 
+// a path that starts with '-' is deleted, not read as an option
+const here = process.cwd()
+process.chdir(base)
+for (const name of ['-rf', '-d']) {
+  write(join(base, name, 'x'), 'x')
+  check(`a folder named ${name} deletes`, (await removeTree($, name, isWindows)) && !existsSync(join(base, name)))
+}
+process.chdir(here)
+
+// linking over an existing link fails, rather than nesting a link inside its target
+const linkTarget = join(base, 'real')
+write(join(linkTarget, 'f'), 'x')
+const relink = join(base, 'relink')
+check('a folder links', await linkFolder($, linkTarget, relink, isWindows))
+check('linking it again is refused', !(await linkFolder($, linkTarget, relink, isWindows)))
+check('and leaves its target untouched', readdirSync(linkTarget).join(',') === 'f', readdirSync(linkTarget).join(','))
+
 rmSync(base, { recursive: true, force: true })
 console.log(failures === 0 ? 'all checks passed' : `${failures} check(s) failed`)
 process.exit(failures === 0 ? 0 : 1)
