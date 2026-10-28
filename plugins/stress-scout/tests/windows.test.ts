@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'claude-code/testing'
 
-import { extendedPath, psQuote, utf16Base64, windowsCanonical, windowsCanonicalText } from '../hooks/lib/platform'
+import { extendedPath, psQuote, removeTreeScript, utf16Base64, windowsCanonical, windowsCanonicalText } from '../hooks/lib/platform'
 import { checkBash, checkRead, checkWrite } from '../hooks/lib/policy'
 
 // the same sandbox as policy.test.ts, as the engine spells it on Windows
@@ -30,6 +30,16 @@ test('PowerShell gets its script encoded, and literals quoted its way', () => {
   expect(extendedPath('C:\\Users\\a/b')).toBe('\\\\?\\C:\\Users\\a\\b')
   expect(extendedPath('\\\\server\\share\\x')).toBe('\\\\?\\UNC\\server\\share\\x')
   expect(extendedPath('\\\\?\\C:\\x')).toBe('\\\\?\\C:\\x')
+})
+
+test('a Windows delete falls back to the plain path where .NET takes no \\\\?\\ path, and checks the one it used', () => {
+  const lines = removeTreeScript("C:\\Users\\O'Brien\\Temp/stress-scout/runs/run-0001-1").split('\n').slice(-4)
+  expect(lines).toEqual([
+    "$target = '\\\\?\\C:\\Users\\O''Brien\\Temp\\stress-scout\\runs\\run-0001-1'",
+    "try { [void][IO.Path]::GetFullPath($target) } catch { $target = 'C:\\Users\\O''Brien\\Temp\\stress-scout\\runs\\run-0001-1' }",
+    'Remove-Tree $target',
+    'if ([IO.Directory]::Exists($target) -or [IO.File]::Exists($target)) { exit 1 }',
+  ])
 })
 
 describe('on Windows the tester may do its job inside the sandbox', () => {
