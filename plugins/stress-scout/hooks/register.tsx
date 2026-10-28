@@ -67,6 +67,7 @@ const pausedAtom = atom({ plugin: 'stress-scout', key: 'paused' } as const, fals
 const seenAtom = atom({ plugin: 'stress-scout', key: 'seenId' } as const, 0)
 const openAtom = atom({ plugin: 'stress-scout', key: 'openId' } as const, 0)
 const suggestedAtom = atom({ plugin: 'stress-scout', key: 'suggestedId' } as const, 0)
+const waitingAtom = atom({ plugin: 'stress-scout', key: 'waiting' } as const, '')
 
 type Config = {
   triageModel: string
@@ -79,6 +80,8 @@ type Config = {
   idleMs: number
   isSweeping: boolean
   sweepGapMs: number
+  isAutoApplying: boolean
+  isOpeningPane: boolean
   maxDollarsPerRun: number
   claudePath: string
   rateLimitPct: number
@@ -116,6 +119,8 @@ export function configOf(options: PluginOptions): Config {
     idleMs: numberOf(options.idleSeconds, 30, 1, 3600) * 1000,
     isSweeping: options.sweepWhenIdle !== false,
     sweepGapMs: numberOf(options.sweepMinutes, 20, 1, 1440) * 60_000,
+    isAutoApplying: options.autoApplyVerifiedFixes !== false,
+    isOpeningPane: options.openPaneOnStart !== false,
     maxDollarsPerRun: numberOf(options.maxDollarsPerRun, 2, 0.05, 100),
     claudePath: typeof options.claudePath === 'string' ? options.claudePath.trim() : '',
     rateLimitPct: numberOf(options.pauseAtRateLimitPercent, 80, 1, 101),
@@ -135,7 +140,10 @@ const live = {
   idleTimer: undefined as Timer | undefined,
   retryTimer: undefined as Timer | undefined,
   watchTimer: undefined as Timer | undefined,
+  autoTimer: undefined as Timer | undefined,
   stopTester: undefined as (() => void) | undefined,
+  /** openPaneOnStart has placed the pane once this load; closing it afterwards is the person's call. */
+  isPaneShown: false,
   firstDirtyAt: 0,
   lastActivityAt: 0,
   isMainBusy: false,
@@ -707,6 +715,7 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     const full = await fullWindow($)
     if (full !== undefined) {
       await log($, `${trigger}: skipped, your ${full} is at or above ${config.rateLimitPct}%`)
+      await update($, waitingAtom, () => `your ${full} is at or above ${config.rateLimitPct}%; automatic runs resume below it`)
       return
     }
     const now = await $.clock.now()
@@ -714,9 +723,12 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     if (live.lastRunStartedAt > 0 && gapLeft > 0) {
       live.retryTimer?.cancel()
       live.retryTimer = $.clock.after(gapLeft + 1000, () => void kick($, trigger))
+      const gap = `${Math.round(config.minGapMs / 60_000)}-minute gap between runs`
+      await update($, waitingAtom, () => `next automatic run at ${clockTime(now + gapLeft + 1000)} (${gap})`)
       return
     }
   }
+  await update($, waitingAtom, () => '')
   const c = await ensureCtx($)
   if (c === undefined) {
     await setPhase($, 'off', live.ctxError)
@@ -823,11 +835,39 @@ async function cleanupRuns($: $, c: Ctx): Promise<void> {
 async function maybeSuggest($: $): Promise<void> {
   if (live.isMainBusy) return
   const [findings, suggested] = await Promise.all([read($, findingsAtom), read($, suggestedAtom)])
-  const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
+  const pending = findings.filter(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
+  // a verified fix is handed over even when a newer, unverified one waits for approval
+  const verified = pending.find(f => f.isVerified)
+  if (live.config.isAutoApplying && verified !== undefined) armAutoApply($, verified.id)
+  // the suggestion still shows while an automatic hand-off waits, so the person sees what is coming
+  const finding = pending[0]
   if (finding === undefined || finding.id === suggested) return
   const shown = await $.prompt.suggest({ text: handoffPrompt(finding) }).catch(() => ({ isShown: false }))
   if (shown.isShown) await update($, suggestedAtom, () => finding.id)
 }
+
+/** autoApplyVerifiedFixes: hand a verified fix over once the session has sat idle; a new turn cancels it. */
+function armAutoApply($: $, id: number): void {
+  live.autoTimer?.cancel()
+  live.autoTimer = $.clock.after(live.config.idleMs, () => {
+    live.autoTimer = undefined
+    void autoApply($, id)
+  })
+}
+
+async function autoApply($: $, id: number): Promise<void> {
+  if (live.isMainBusy || (await read($, pausedAtom))) return
+  const finding = (await read($, findingsAtom)).find(f => f.id === id)
+  if (finding === undefined || finding.status !== 'new') return
+  await log($, `#${id}: verified fix handed to Claude automatically`)
+  $.ui.toast(`stress-scout is handing verified fix #${id} to Claude`, { timeoutMs: 8000 })
+  await handOff($, finding)
+}
+
+/** A finding Claude can act on: a fix to apply, or a next step for a real problem. */
+const canHandOver = (f: Finding): boolean => f.patch !== '' || (isActionable(f.verdict) && f.nextStep !== '')
+
+const handOverLabel = (f: Finding): string => (f.patch !== '' ? 'Apply via Claude' : 'Send to Claude')
 
 const blankFinding = (run: Run, at: number): Finding => ({
   id: run.id,
@@ -920,6 +960,7 @@ async function noteEdit($: $): Promise<void> {
   live.lastActivityAt = now
   if (live.firstDirtyAt === 0) live.firstDirtyAt = now
   const wait = Math.max(0, Math.min(quietMs, live.firstDirtyAt + maxWaitMs - now))
+  await update($, waitingAtom, () => `scanning the change at ${clockTime(now + wait)}, once edits settle`)
   live.quietTimer?.cancel()
   live.quietTimer = $.clock.after(wait, () => {
     live.firstDirtyAt = 0
@@ -1043,14 +1084,33 @@ async function runNow($: $, focus?: string): Promise<string> {
     : 'Stress-testing the latest change (or the riskiest untested code if nothing changed). Results land in /stress show.'
 }
 
+/** openPaneOnStart: a session with no surface yet (the app, the SDK) is tried again when its first turn starts. */
+async function autoOpenPane($: $): Promise<void> {
+  if (!live.config.isOpeningPane || live.isPaneShown) return
+  // with nothing attached (a -p run, an SDK host) ui.open has nowhere to place it and the engine logs an error
+  if ((await $.session.surfaces()).length === 0) return
+  const opened = await $.ui.open({ id: PANE, title: 'Stress Scout' }).catch(() => ({ isPlaced: false }))
+  live.isPaneShown = opened.isPlaced
+}
+
 async function openPane($: $): Promise<string> {
   await $.ui.open({ id: PANE, title: 'Stress Scout' })
   return 'Stress Scout pane opened.'
 }
 
+/** What the next automatic run waits on, in words. */
+function nextText(waiting: string, runsUsed: number): string {
+  const { config } = live
+  if (runsUsed >= config.maxRuns) return `the automatic cap (${runsUsed}/${config.maxRuns}) is reached; Run now still works`
+  if (waiting !== '') return waiting
+  return config.isSweeping
+    ? 'tests the next risky edit, or sweeps untested code when the session goes idle'
+    : 'tests the next risky edit'
+}
+
 async function statusText($: $): Promise<string> {
   const { config } = live
-  const [phase, findings, runsUsed, tokens, spent, paused, run] = await Promise.all([
+  const [phase, findings, runsUsed, tokens, spent, paused, run, waiting] = await Promise.all([
     read($, phaseAtom),
     read($, findingsAtom),
     read($, runsUsedAtom),
@@ -1058,6 +1118,7 @@ async function statusText($: $): Promise<string> {
     read($, dollarsAtom),
     read($, pausedAtom),
     read($, runAtom),
+    read($, waitingAtom),
   ])
   const now = await $.clock.now()
   const state =
@@ -1067,7 +1128,7 @@ async function statusText($: $): Promise<string> {
         ? 'Paused.'
         : phase.kind === 'off'
           ? `Off: ${phase.detail}.`
-          : 'Watching.'
+          : `Watching. Next: ${nextText(waiting, runsUsed)}.`
   const lines = [
     state,
     `automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} and ${compactTokens(tokens)} tokens this session · triage ${config.triageModel}, tester ${config.testerModel}`,
@@ -1081,7 +1142,7 @@ async function statusText($: $): Promise<string> {
 }
 
 const HELP = [
-  '/stress            stress-test the latest change now (a sweep when nothing changed)',
+  '/stress            stress-test the latest change now (a sweep when nothing changed; also /stress run or start)',
   '/stress <focus>    stress-test something specific, e.g. /stress the retry logic in api/client.ts',
   '/stress show       open the Stress Scout pane',
   '/stress status     what it is doing and what it found',
@@ -1098,6 +1159,7 @@ async function runCommand($: $, args: string): Promise<string> {
     case '':
     case 'now':
     case 'run':
+    case 'start':
       return runNow($)
     case 'show':
     case 'pane':
@@ -1142,6 +1204,7 @@ async function onSessionStart($: $): Promise<void> {
   live.watchTimer?.cancel()
   live.watchTimer = $.clock.every(60_000, () => void heartbeat($))
   await setPhase($, 'idle')
+  await autoOpenPane($)
 }
 
 async function onMainTurnEnd($: $): Promise<void> {
@@ -1171,7 +1234,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', ($, e, next) => {
-    for (const timer of [live.quietTimer, live.idleTimer, live.retryTimer, live.watchTimer]) timer?.cancel()
+    for (const timer of [live.quietTimer, live.idleTimer, live.retryTimer, live.watchTimer, live.autoTimer]) timer?.cancel()
     live.stopTester?.()
     return next(e)
   })
@@ -1181,6 +1244,9 @@ export const register: Register = (on, options) => {
       live.isMainBusy = true
       live.idleTimer?.cancel()
       live.idleTimer = undefined
+      live.autoTimer?.cancel()
+      live.autoTimer = undefined
+      void autoOpenPane($)
     }
     return next(e)
   })
@@ -1255,8 +1321,8 @@ export const register: Register = (on, options) => {
           </Text>
         )}
         <Box flexDirection="row" gap={isGraphical ? 'xs' : 1}>
-          {finding.patch !== '' && (
-            <Button key="apply" label="Apply via Claude" variant="primary" hotkey="a" onPress={() => void apply($, finding.id)} />
+          {canHandOver(finding) && (
+            <Button key="apply" label={handOverLabel(finding)} variant="primary" hotkey="a" onPress={() => void apply($, finding.id)} />
           )}
           <Button key="details" label="Details" hotkey="d" onPress={() => void showPane($, finding.id)} />
           <Button key="dismiss" label="Dismiss" hotkey="x" onPress={() => void dismiss($, finding.id)} />
@@ -1270,7 +1336,7 @@ export const register: Register = (on, options) => {
     const { config } = live
     // the terminal keeps its compact rows; a graphical surface (the app, an editor, a phone) gets cards
     const isGraphical = e.surface !== 'terminal'
-    const [phase, findings, activity, runsUsed, tokens, spent, paused, openId, run] = await Promise.all([
+    const [phase, findings, activity, runsUsed, tokens, spent, paused, openId, run, waiting] = await Promise.all([
       read($, phaseAtom),
       read($, findingsAtom),
       read($, activityAtom),
@@ -1280,7 +1346,9 @@ export const register: Register = (on, options) => {
       read($, pausedAtom),
       read($, openAtom),
       read($, runAtom),
+      read($, waitingAtom),
     ])
+    const next = phase.kind === 'idle' && !paused ? nextText(waiting, runsUsed) : ''
     const state =
       phase.kind === 'off'
         ? `off: ${phase.detail}`
@@ -1316,6 +1384,11 @@ export const register: Register = (on, options) => {
           <Text dimColor size="footnote" tabular wrap="truncate-end">
             {`automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} · ${compactTokens(tokens)} tokens · ${mode}`}
           </Text>
+          {next !== '' && (
+            <Text key="next" dimColor size="footnote" wrap="wrap">
+              {`Next: ${next}`}
+            </Text>
+          )}
         </Box>
         <Box flexDirection="row" gap={row}>
           {run !== null ? (
@@ -1327,8 +1400,8 @@ export const register: Register = (on, options) => {
         </Box>
         {findings.length === 0 && (
           <Text dimColor>
-            No findings yet. stress-scout tests risky changes as they land and sweeps untested code while the session is
-            idle. Type /stress to run one now.
+            No findings yet, and nothing for you to do: stress-scout tests each risky change once edits settle, sweeps
+            untested code while the session is idle, and puts what it finds here. Run now skips the wait.
           </Text>
         )}
         {findings.slice(0, 12).map(f => {
@@ -1378,8 +1451,8 @@ export const register: Register = (on, options) => {
                 </Box>
               )}
               <Box flexDirection="row" gap={row}>
-                {isNew && f.patch !== '' && (
-                  <Button key={`apply-${f.id}`} label="Apply via Claude" variant="primary" onPress={() => void apply($, f.id)} />
+                {isNew && canHandOver(f) && (
+                  <Button key={`apply-${f.id}`} label={handOverLabel(f)} variant="primary" onPress={() => void apply($, f.id)} />
                 )}
                 <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
                 {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}

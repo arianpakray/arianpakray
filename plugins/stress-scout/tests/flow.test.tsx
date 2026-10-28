@@ -132,6 +132,12 @@ type World = {
   rateLimits: { kind: string; percentUsed: number }[]
   /** The session's credential as `$.session.authorize()` answers it; `refused` makes the call throw. */
   credential: { handle: string; kind: 'bearer' | 'api-key' } | null | 'refused'
+  /** Each pane the plugin asked to open, by id. */
+  opened: string[]
+  /** what $.session.surfaces() answers: one attached window unless a test empties it */
+  surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
+  /** The testers' final reports, in the order they run; REPORT once these run out. */
+  reports: string[]
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -154,6 +160,9 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     existing: new Set(),
     rateLimits: [],
     credential: null,
+    opened: [],
+    surfaces: ['desktop'],
+    reports: [],
   }
   mock.store(on, stored)
   mock.env(on, place.env)
@@ -198,7 +207,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     yield { stream: 'stdout' as const, text: line(toolUse) + line(toolUse).slice(0, 20) }
     yield { stream: 'stdout' as const, text: line(toolUse).slice(20) }
     yield { stream: 'stderr' as const, text: 'warming up\n' }
-    yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: REPORT, total_cost_usd: 0.42, usage: USAGE }) }
+    yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: w.reports.shift() ?? REPORT, total_cost_usd: 0.42, usage: USAGE }) }
     return { value: { code: 0, signal: null } }
   } as never)
   on('model.complete', ($, e) => {
@@ -214,7 +223,11 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     w.toasts.push(e.text)
     return { value: undefined }
   })
-  on('ui.open', () => ({ value: { isPlaced: true as const } }))
+  on('session.surfaces', () => ({ value: w.surfaces }))
+  on('ui.open', ($, e) => {
+    w.opened.push(e.id)
+    return { value: { isPlaced: true as const } }
+  })
   on('prompt.suggest', ($, e) => {
     w.suggestions.push(e.text)
     return { isShown: true }
@@ -407,6 +420,133 @@ test('a focused /stress run skips triage and goes straight to the tester', { tim
   expect(w.triagePrompts).toHaveLength(0)
   expect(w.spawned).toHaveLength(1)
   expect(w.spawned[0]?.input).toContain('TARGET: the retry loop in api/client.ts')
+})
+
+test('the pane opens by itself when a session starts', { timeoutMs: 30_000 }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  expect(w.opened).toEqual(['stress-scout'])
+})
+
+test('a session with no surface attached does not try to place the pane', { timeoutMs: 30_000 }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  w.surfaces = []
+  await $.session.start({ cwd: ROOT, surface: null, isInteractive: false })
+  expect(w.opened).toEqual([])
+})
+
+test('/stress start runs a test, as /stress run does', { timeoutMs: 30_000 }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  world(on)
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  const started = await $.command.run(stress('start') as never)
+  expect(started.text).toContain('Stress-testing the latest change')
+})
+
+test('openPaneOnStart off leaves the pane to /stress show', { timeoutMs: 30_000, options: { openPaneOnStart: false } }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  expect(w.opened).toEqual([])
+  await $.command.run(stress('show') as never)
+  expect(w.opened).toEqual(['stress-scout'])
+})
+
+test('a newer unverified finding does not hold back an older verified fix', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+
+  // the person starts a turn, which holds the hand-off; a focused run meanwhile finds something unverified
+  await $.turn.start({ turnId: 't1' } as never)
+  w.reports.push(REPORT.replace('"verified":true', '"verified":false').replace('evict before the await', 'unverified guess'))
+  await $.command.run(stress('the retry loop in api/client.ts') as never)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(2)
+  await $.turn.complete({ turnId: 't1', answer: '' } as never)
+
+  await clock.advance(30_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
+})
+
+test('the pane says what the next automatic run waits on', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  const mount = () => $.ui.mount({ plugin: 'stress-scout', surface: 'desktop', component: 'Pane', requestId: 'stress-scout', props: PANE })
+
+  let pane = await mount()
+  expect(await pane.find({ text: /Next: tests the next risky edit, or sweeps untested code/ })).toBeDefined()
+  await pane.unmount()
+
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  pane = await mount()
+  expect(await pane.find({ text: /Next: scanning the change at \d\d:\d\d, once edits settle/ })).toBeDefined()
+  await pane.unmount()
+
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+
+  // a second change inside the gap between runs names the time it will run
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/README.md`, old_string: 'a', new_string: 'b' })
+  w.tree = TREE_C
+  await clock.advance(45_000)
+  await clock.settle()
+  pane = await mount()
+  expect(await pane.find({ text: /Next: next automatic run at \d\d:\d\d \(3-minute gap between runs\)/ })).toBeDefined()
+  await pane.unmount()
+  expect((await $.command.run(stress('status') as never)).text).toMatch(/Next: next automatic run at/)
+})
+
+test('with autoApplyVerifiedFixes off, a verified fix waits for a tap', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.suggestions.at(-1)).toBe('Apply stress-scout fix #1: evict before the await')
+  await clock.advance(5 * 60_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(0)
+})
+
+test('by default, a verified fix goes to Claude once the session sits idle', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+  expect(w.submitted).toHaveLength(0)
+
+  await clock.advance(29_000)
+  expect(w.submitted).toHaveLength(0)
+  await clock.advance(1_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
+  expect(w.toasts.at(-1)).toBe('stress-scout is handing verified fix #1 to Claude')
+  expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
+
+  // handed over once; later idle moments don't send it again
+  await clock.advance(5 * 60_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
 })
 
 describe('the tester bills what the session bills', () => {

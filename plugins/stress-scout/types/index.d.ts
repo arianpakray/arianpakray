@@ -68,6 +68,8 @@ declare module 'claude-code' {
       seenId: number
       openId: number
       suggestedId: number
+      /** What the next automatic run waits on, when that is a time or a limit; '' when it just waits for an edit. */
+      waiting: string
     }
   }
 }
