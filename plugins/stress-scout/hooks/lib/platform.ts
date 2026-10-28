@@ -136,7 +136,8 @@ export function removeTreeScript(path: string): string {
 
 /** Deletes a file or a folder tree, never through a link; true when it is gone. */
 export async function removeTree($: EngineInterface, path: string, isWindows: boolean, timeoutMs = 120_000): Promise<boolean> {
-  if (!isWindows) return (await $.process.run(['rm', '-rf', path], { timeoutMs })).exitCode === 0
+  // `--`: a path that starts with '-' is a path, not an option rm skips while answering success
+  if (!isWindows) return (await $.process.run(['rm', '-rf', '--', path], { timeoutMs })).exitCode === 0
   return (await powershell($, removeTreeScript(path), timeoutMs)).exitCode === 0
 }
 
@@ -158,7 +159,8 @@ export async function createExclusive($: EngineInterface, path: string, text: st
 
 /** Links folder `link` to `target`: a symbolic link, or on Windows a junction (no admin rights needed). */
 export async function linkFolder($: EngineInterface, target: string, link: string, isWindows: boolean): Promise<boolean> {
-  if (!isWindows) return (await $.process.run(['ln', '-s', target, link])).exitCode === 0
+  // -n: an existing link to a folder fails the call, rather than gaining a link inside the folder it points to
+  if (!isWindows) return (await $.process.run(['ln', '-sn', '--', target, link])).exitCode === 0
   const script = `New-Item -ItemType Junction -Path ${psQuote(link.replace(/\//g, '\\'))} -Target ${psQuote(target.replace(/\//g, '\\'))} -ErrorAction Stop | Out-Null`
   return (await powershell($, script, 60_000)).exitCode === 0
 }
