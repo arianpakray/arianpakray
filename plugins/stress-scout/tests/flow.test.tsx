@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from 'claude-code/testing'
+import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { fnv } from '../hooks/lib/util'
@@ -138,6 +138,10 @@ type World = {
   surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
+  /** The project's own git: its branch and short HEAD. */
+  project: { branch: string; head: string }
+  /** What hashing the project's src/cache.ts answers. */
+  fileSha: string
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -163,6 +167,8 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     opened: [],
     surfaces: ['desktop'],
     reports: [],
+    project: { branch: 'main', head: 'abc1234' },
+    fileSha: BLOB,
   }
   mock.store(on, stored)
   mock.env(on, place.env)
@@ -189,6 +195,9 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
       return { value: { exitCode: 128, stdout: '', stderr: 'fatal: bad object', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     if (argv.includes('rev-parse --path-format')) return ok(`${ROOT}/.git\n`)
+    if (argv.includes('rev-parse --short')) return ok(`${w.project.head}\n`)
+    if (argv.includes('symbolic-ref')) return ok(`${w.project.branch}\n`)
+    if (argv.includes('hash-object')) return ok(`${w.fileSha}\n`)
     if (argv.includes('rev-parse --verify')) return ok(`${HEAD}\n`)
     if (argv.endsWith('write-tree')) return ok(`${index.endsWith('snapshot.index') ? AFTER : w.tree}\n`)
     if (argv.includes('--name-only')) return ok('src/cache.ts\n')
@@ -476,6 +485,50 @@ test('a newer unverified finding does not hold back an older verified fix', { ti
   await clock.settle()
   expect(w.submitted).toHaveLength(1)
   expect(w.submitted[0]?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
+})
+
+/** A finished run's finding, waiting for a tap. */
+async function foundOne($: Engine, on: On): Promise<{ w: World; clock: ReturnType<typeof mock.clock> }> {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+  return { w, clock }
+}
+
+const handOver = async ($: Engine, clock: { settle(): Promise<unknown> }): Promise<void> => {
+  await $.command.run(stress('apply 1') as never)
+  await clock.settle()
+}
+
+test('a handoff from the same branch and files carries no warning, and spells out the rerun', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { w, clock } = await foundOne($, on)
+  await handOver($, clock)
+  const text = w.submitted.at(-1)?.text ?? ''
+  expect(text.split('\n')[0]).toBe('Apply stress-scout fix #1: evict before the await')
+  expect(text).not.toContain('Made against')
+  expect(text).not.toContain('changed since the snapshot')
+  expect(text).toMatch(/Rerun it with: cd \S+\/snapshot && timeout 120 node \.stress-scout\/race\.mjs/)
+})
+
+test('a handoff made from another branch or commit says where it was made', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { w, clock } = await foundOne($, on)
+  w.project = { branch: 'feature-x', head: 'def5678' }
+  await handOver($, clock)
+  expect(w.submitted.at(-1)?.text.split('\n')[0]).toBe("Made against main@abc1234; you're on feature-x@def5678.")
+})
+
+test('a handoff names a patched file that changed in the project since the snapshot', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { w, clock } = await foundOne($, on)
+  w.fileSha = '1'.repeat(40)
+  await handOver($, clock)
+  const text = w.submitted.at(-1)?.text ?? ''
+  expect(text.split('\n')[0]).toBe('src/cache.ts has changed since the snapshot.')
+  expect(text).not.toContain('Made against')
 })
 
 test('the pane says what the next automatic run waits on', { timeoutMs: 30_000 }, async ($, on) => {

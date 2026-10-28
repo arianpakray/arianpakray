@@ -2,6 +2,14 @@ export type Trigger = 'change' | 'idle' | 'sweep' | 'manual'
 
 export type Verdict = 'broke' | 'degraded' | 'held' | 'inconclusive'
 
+/** Where the project stood when a finding's snapshot was taken (branch and head are empty outside git). */
+export type Origin = {
+  branch: string
+  head: string
+  /** Blob id of each file the fix targets, as the snapshot held it. */
+  files: Record<string, string>
+}
+
 export type Finding = {
   id: number
   at: number
@@ -21,6 +29,8 @@ export type Finding = {
   nextStep: string
   rerun: string
   snapshot: string
+  /** Absent on findings saved by an earlier version. */
+  origin?: Origin
   confidence: string
   status: 'new' | 'applied' | 'dismissed'
   durationMs: number
@@ -48,6 +58,8 @@ export type Run = {
   hash: string
   runDir: string
   snapshot: string
+  branch: string
+  head: string
   baseTree: string
   startedAt: number
   tokens: number
