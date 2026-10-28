@@ -85,6 +85,12 @@
       "description": "When a test proves its own fix and the session has been idle for the idle seconds, send the fix to Claude without a tap.",
       "default": true
     },
+    "testerOffline": {
+      "type": "boolean",
+      "title": "Run the tester without network",
+      "description": "Cut the network off from the commands the tester runs (sandbox-exec on macOS, unshare on Linux); the tester itself still reaches the model.",
+      "default": true
+    },
     "claudePath": {
       "type": "string",
       "title": "Path to the claude binary",

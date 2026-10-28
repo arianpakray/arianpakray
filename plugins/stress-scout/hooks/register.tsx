@@ -44,7 +44,7 @@ import {
   patchOf,
   type Shadow,
 } from './lib/shadow'
-import { homeFolder, isWindowsPath, portable, removeTree, tempRoot, windowsCanonical } from './lib/platform'
+import { type Offline, homeFolder, isWindowsPath, offlineCommand, portable, probeOffline, removeTree, tempRoot, windowsCanonical } from './lib/platform'
 import { ago, basename, clip, clockTime, compactTokens, fnv, isInside, oneLine, slug, trimSlash } from './lib/util'
 
 type $ = EngineInterface
@@ -86,6 +86,7 @@ type Config = {
   claudePath: string
   rateLimitPct: number
   testerTimeoutMs: number
+  isOffline: boolean
 }
 
 type Ctx = {
@@ -125,6 +126,7 @@ export function configOf(options: PluginOptions): Config {
     claudePath: typeof options.claudePath === 'string' ? options.claudePath.trim() : '',
     rateLimitPct: numberOf(options.pauseAtRateLimitPercent, 80, 1, 101),
     testerTimeoutMs: numberOf(options.testerTimeoutMinutes, 20, 2, 120) * 60_000,
+    isOffline: options.testerOffline !== false,
   }
 }
 
@@ -132,6 +134,8 @@ export function configOf(options: PluginOptions): Config {
 const live = {
   role: 'scout' as 'scout' | 'tester',
   box: undefined as Sandbox | undefined,
+  /** Tester role: how its Bash commands lose the network, as the scout found it. */
+  offline: '' as Offline,
   config: configOf({}),
   ctx: undefined as Ctx | undefined,
   ctxError: '',
@@ -552,7 +556,7 @@ function testerArgv($: $, exec: string, run: Run): string[] {
 }
 
 /** Runs the tester process to its end (or the deadline, or a Stop), then files what it found. */
-async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<void> {
+async function superviseTester($: $, c: Ctx, run: Run, prompt: string, offline: Offline): Promise<void> {
   const { config } = live
   const exec = config.claudePath !== '' ? config.claudePath : ((await $.env.get('CLAUDE_CODE_EXECPATH')) ?? '') || 'claude'
   const box = sandboxOf(c, run)
@@ -562,6 +566,7 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
     STRESS_SCOUT_ROOTS: JSON.stringify(box.roots),
     STRESS_SCOUT_RUN_DIRS: JSON.stringify(box.runDirs),
     STRESS_SCOUT_HOME: box.home,
+    STRESS_SCOUT_OFFLINE: offline,
     // Windows programs read TEMP and TMP; Git Bash and the rest read TMPDIR
     ...tempEnv(c.isWindows ? portable(`${run.runDir}/tmp`) : `${run.runDir}/tmp`, c.isWindows),
     // claude -p bills an ANTHROPIC_API_KEY it finds in the environment without asking, where a session
@@ -688,7 +693,10 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     linkedDeps: linked,
     isWindows: c.isWindows,
   })
-  void superviseTester($, c, run, prompt)
+  // the claude process itself needs the API; only the commands it runs lose the network
+  const offline = live.config.isOffline ? await probeOffline($, c.isWindows).catch(() => '' as const) : ''
+  await log($, `#${args.id} network: ${offline === '' ? 'guard only' : `off (${offline})`}`)
+  void superviseTester($, c, run, prompt, offline)
 }
 
 const manualPlan = (focus: string): Plan => ({
@@ -1189,6 +1197,8 @@ async function onSessionStart($: $): Promise<void> {
   if ((await $.env.get('STRESS_SCOUT_ROLE')) === 'tester') {
     live.role = 'tester'
     live.box = await loadSandbox($)
+    const how = await $.env.get('STRESS_SCOUT_OFFLINE')
+    live.offline = how === 'sandbox-exec' || how === 'unshare' ? how : ''
     return
   }
   await $.command.register({
@@ -1260,7 +1270,11 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     if (live.role === 'tester') {
       const check = await testerCheck($, String(e.tool), e as unknown as Record<string, unknown>)
-      return check.isAllowed ? next(e) : { deny: check.reason }
+      if (!check.isAllowed) return { deny: check.reason }
+      // wrapped only once the guard has passed the original command
+      return e.tool === 'Bash' && live.offline !== '' && typeof e.command === 'string'
+        ? next({ ...e, command: offlineCommand(live.offline, e.command) })
+        : next(e)
     }
     const ran = await next(e)
     if (EDIT_TOOLS.has(String(e.tool)) && ran.deny === undefined && ran.isError !== true) await noteEdit($)
