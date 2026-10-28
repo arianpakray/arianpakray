@@ -24,13 +24,22 @@ Ground rules (a guard enforces them; calls that break them are refused with the 
 
 Procedure:
 1. Read the target and only what it needs. Name the single riskiest assumption it makes.
-2. Write the smallest deterministic harness (fixed seeds) that attacks that assumption: races and concurrency, load and throughput cliffs, large or deeply nested input, malformed or adversarial input (fuzz or property-based), resource exhaustion and leaks, timeouts, retries and partial failure, numeric edges (overflow, precision, time zones). Use the project's language, and its test runner when convenient; otherwise a standalone script.
+2. Write the smallest deterministic harness (fixed seeds) that attacks that assumption: races and concurrency, load and throughput cliffs, large or deeply nested input, malformed or adversarial input (fuzz or property-based), resource exhaustion and leaks, timeouts, retries and partial failure, numeric edges (overflow, precision, time zones). Use the project's language, and its test runner when convenient; otherwise a standalone script. Only feed inputs the code's own declared types and contracts allow.
 3. Run it and escalate in steps (e.g. 10, 1k, 100k items; 1, 16, 256 concurrent) until it breaks or holds at a credible ceiling. Record numbers: failures/total, throughput, p95 latency, peak memory, and the smallest failing input.
 4. Verdict: broke (crash, wrong result, hang, data loss, unbounded growth) | degraded (works but hits a cliff: superlinear time, memory growth, latency blowup) | held (survived a credible ceiling) | inconclusive (could not run it; say why). Never manufacture a failure: held is a valid and useful result.
 5. If broke or degraded: fix the root cause in SNAPSHOT's source (minimal and idiomatic; do not change the harness), rerun the identical harness, and record the after-numbers. At most two attempts. If it still fails, report verified false.
 6. End your final message with your report: one \`\`\`json block, nothing after it:
 {"target": "path or path:symbol", "kind": "concurrency|load|fuzz|edge|resource|fault|perf|security", "verdict": "broke|degraded|held|inconclusive", "headline": "<=90 chars, with the key number", "evidence": "<=500 chars: failing input, error, measurements", "before": "<=100 chars: the metric before the fix", "after": "<=100 chars: the same metric after the fix, or empty", "fix": {"summary": "<=100 chars", "explanation": "<=400 chars: why it works", "files": ["paths relative to SNAPSHOT that you changed"], "verified": true|false} or null, "nextStep": "<=200 chars: what the developer's coding agent should do next, imperative", "rerun": "the command that reruns the harness, run from SNAPSHOT", "confidence": "high|medium|low"}
 Keep every string short and concrete: numbers beat adjectives.`
+
+/** The relative path of the engine's event types in a Claude Code plugin project. */
+export const PLUGIN_TYPES = '.claude-plugin/types/claude-code/index.d.ts'
+
+/** Whether the target is a command guard: its bypass findings must be shown to run under real bash. */
+export const isGuardTarget = (plan: Pick<Triage, 'target' | 'files' | 'kind' | 'why'>): boolean => {
+  const where = `${plan.target} ${plan.files.join(' ')}`
+  return /policy\.ts|checkBash/i.test(where) || (plan.kind === 'security' && /guard/i.test(`${where} ${plan.why}`))
+}
 
 export type Memory = {
   v: 1
@@ -127,6 +136,10 @@ export function testerTask(args: {
   root: string
   linkedDeps: readonly string[]
   isWindows?: boolean
+  /** The project is a Claude Code plugin (a manifest and a hooks module). */
+  isPlugin?: boolean
+  /** Whether the engine's event types are laid in the snapshot (see PLUGIN_TYPES). */
+  hasTypes?: boolean
 }): string {
   const lines = [
     `stress-scout run #${args.id} (${args.trigger}).`,
@@ -149,6 +162,21 @@ export function testerTask(args: {
   if (args.linkedDeps.length > 0) {
     lines.push(
       `- Linked from the real project (read-only: never write, install or cd into them): ${args.linkedDeps.join(', ')}`,
+    )
+  }
+  lines.push(
+    "INPUTS: No test inputs the engine's types rule out: if a field is typed `string`, don't feed it a number, null or a missing value. Only feed inputs the code's own declared types and contracts allow.",
+  )
+  if (args.isPlugin === true) {
+    lines.push(
+      args.hasTypes === true
+        ? `PLUGIN: this project is a Claude Code plugin. The event input types its hooks receive are in ${args.snapshot}/${PLUGIN_TYPES} (thousands of lines: grep it for the event you feed, never read it whole). A hook payload must match them.`
+        : 'PLUGIN: this project is a Claude Code plugin, but its engine types are not laid in the snapshot. Take the event input types from the hook signatures in the code, and keep every payload within them.',
+    )
+  }
+  if (isGuardTarget(args.plan)) {
+    lines.push(
+      "GUARD METHOD: this target is a command guard. Each bypass case must be shown to actually run under real bash with the dangerous commands stubbed as shell functions before you report it, e.g. bash -c 'git(){ echo RAN; }; <case>' (stub every dangerous command that way; never run the real one). Report a bypass only when the guard allowed the string AND the stub printed RAN; a case you did not run this way is not a finding.",
     )
   }
   if (args.isWindows === true) {

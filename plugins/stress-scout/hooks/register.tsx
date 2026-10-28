@@ -23,6 +23,7 @@ import {
   handoffContext,
   handoffMessage,
   handoffPrompt,
+  PLUGIN_TYPES,
   sweepTriagePrompt,
   testerTask,
   type Memory,
@@ -55,6 +56,9 @@ const PANE = 'stress-scout'
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 const TESTER_TOOLS = 'Bash,Read,Write,Edit'
 const KEEP_RUNS = 8
+const RERUN_TIMEOUT_MS = 120_000
+/** The statuses a finding's harness is rerun in: its fix may have landed, or may since have broken. */
+const RERUN_STATUSES = new Set<Finding['status']>(['applied', 'fixed', 'regressed'])
 const NO_CHANGE = 'no change since the last scan'
 
 const phaseAtom = atom({ plugin: 'stress-scout', key: 'phase' } as const, { kind: 'idle', detail: '', since: 0 })
@@ -159,6 +163,12 @@ const live = {
   lastRunStartedAt: 0,
   seenTree: '',
   seenTreeAt: 0,
+  /** Findings whose files changed while their harness was rerunning: they rerun once the turn ends. */
+  staleReruns: new Set<number>(),
+  /** Findings whose harness is rerunning now. */
+  rerunning: new Set<number>(),
+  /** Findings whose harness has been rerun since they were handed over. */
+  rerun: new Set<number>(),
 }
 
 const PRIORITY: Record<Trigger, number> = { manual: 4, change: 3, idle: 2, sweep: 1 }
@@ -197,6 +207,10 @@ const isSnapshotPath = (path: string): boolean => /[\\/]stress-scout[\\/][^\\/]+
 
 /** An absolute path, POSIX or Windows (`C:\` or `C:/`; a `\\` network path counts too). */
 const isAbsolutePath = (path: string): boolean => path.startsWith('/') || isWindowsPath(path)
+
+/** A file inside the project, as the finding names it: relative, never up a level, never the harness. */
+const isProjectPath = (path: string): boolean =>
+  path !== '' && !isAbsolutePath(path) && !/(^|[\\/])\.\.([\\/]|$)/.test(path) && !path.startsWith('.stress-scout')
 
 /** Whether `path` is `dir` or inside it, comparing as the platform does (Windows ignores case and the separator). */
 const isWithin = (path: string, dir: string, isWindows: boolean): boolean =>
@@ -657,6 +671,18 @@ type StartArgs = {
   hash: string
 }
 
+/** Whether the engine's event types are in the snapshot; copied from the project when only it has them. */
+async function layTypes($: $, c: Ctx, snapshot: string): Promise<boolean> {
+  if (await $.fs.exists(`${snapshot}/${PLUGIN_TYPES}`)) return true
+  if (!(await $.fs.exists(`${c.root}/${PLUGIN_TYPES}`))) return false
+  try {
+    await $.fs.write(`${snapshot}/${PLUGIN_TYPES}`, await $.fs.read(`${c.root}/${PLUGIN_TYPES}`))
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
   const startedAt = await $.clock.now()
   const runDir = `${c.scratch}/runs/run-${String(args.id).padStart(4, '0')}-${startedAt}`
@@ -667,6 +693,7 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     trigger: args.trigger,
     target: args.plan.target,
     kind: args.plan.kind,
+    files: args.plan.files,
     memoryKey: args.memoryKey,
     hash: args.hash,
     runDir,
@@ -686,6 +713,8 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
   live.lastRunStartedAt = startedAt
   await setPhase($, 'test', `${clip(args.plan.target, 50)} (${args.plan.kind})`)
   await log($, `#${args.id} ${args.trigger}: testing ${args.plan.target} (${args.plan.kind}): ${args.plan.why}`)
+  const isPlugin = (await $.fs.exists(`${c.root}/.claude-plugin/plugin.json`)) && (await $.fs.exists(`${c.root}/hooks`))
+  const hasTypes = isPlugin && (await layTypes($, c, snapshot))
   const prompt = testerTask({
     id: args.id,
     trigger: args.trigger,
@@ -697,6 +726,8 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     root: c.isWindows ? portable(c.root) : c.root,
     linkedDeps: linked,
     isWindows: c.isWindows,
+    isPlugin,
+    hasTypes,
   })
   // the claude process itself needs the API; only the commands it runs lose the network
   const offline = live.config.isOffline ? await probeOffline($, c.isWindows).catch(() => '' as const) : ''
@@ -901,6 +932,7 @@ const blankFinding = (run: Run, at: number): Finding => ({
   isVerified: false,
   nextStep: '',
   rerun: '',
+  files: run.files,
   snapshot: run.snapshot,
   confidence: 'low',
   status: 'new',
@@ -944,6 +976,7 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
     isVerified: report?.fix?.isVerified === true && patch !== '',
     nextStep: report?.nextStep ?? '',
     rerun: report?.rerun ?? '',
+    files: unique([...run.files, ...(report?.fix?.files ?? [])]).filter(isProjectPath),
     confidence: report?.confidence ?? 'low',
     tokens: run.tokens + outcome.tokens,
     cost: outcome.cost,
@@ -968,6 +1001,83 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
   await setPhase($, 'idle')
   if (c !== undefined) await cleanupRuns($, c)
   void drainPending($)
+}
+
+// ---- reruns: did the fix land? -----------------------------------------------------
+
+/**
+ * Reruns a finding's stored harness on the project's current files: no model, no tester.
+ * The target files are copied into its snapshot over the tester's own edit, then the rerun
+ * command runs there, guarded like the tester's own calls. Exit 0 (or a lone PASS line) means
+ * the fix holds; anything else, a timeout included, means the finding regressed.
+ */
+async function rerunFinding($: $, c: Ctx, finding: Finding): Promise<void> {
+  const files = (finding.files ?? []).filter(isProjectPath)
+  if (finding.rerun === '' || files.length === 0) return
+  if (!(await $.fs.exists(`${finding.snapshot}/.stress-scout/.keep`))) {
+    await log($, `#${finding.id}: its snapshot is gone, so the harness was not rerun`)
+    return
+  }
+  const runDir = finding.snapshot.replace(/[\\/]snapshot[\\/]?$/, '')
+  const box = sandboxOf(c, { runDir } as Run)
+  const check = checkBash(finding.rerun, box)
+  if (!check.isAllowed) {
+    await log($, `#${finding.id}: the stored harness command was refused, so it was not rerun: ${check.reason}`)
+    return
+  }
+  live.rerunning.add(finding.id)
+  try {
+    for (const file of files) {
+      const text = await $.fs.read(`${c.root}/${file}`).catch(() => undefined)
+      if (text !== undefined) await $.fs.write(`${finding.snapshot}/${file}`, text)
+    }
+    const shell = c.isWindows ? 'bash' : 'sh'
+    const result = await $.process
+      .run([shell, '-c', finding.rerun], {
+        cwd: finding.snapshot,
+        env: tempEnv(c.isWindows ? portable(`${runDir}/tmp`) : `${runDir}/tmp`, c.isWindows),
+        timeoutMs: RERUN_TIMEOUT_MS,
+      })
+      .catch(() => undefined)
+    const passed = result !== undefined && (result.exitCode === 0 || (/^\s*PASS(ED)?\s*$/m.test(result.stdout) && !/FAIL/i.test(result.stdout)))
+    const status: Finding['status'] = passed ? 'fixed' : 'regressed'
+    await update($, findingsAtom, list => list.map(f => (f.id === finding.id ? { ...f, status } : f)))
+    const detail = result === undefined ? 'timed out or could not run' : `exit ${result.exitCode}`
+    await log($, `#${finding.id} ${status}: the harness reran on the current files (${detail})`)
+  } catch (error) {
+    await log($, `#${finding.id}: the harness could not be rerun: ${messageOf(error)}`)
+  } finally {
+    live.rerunning.delete(finding.id)
+    live.rerun.add(finding.id)
+  }
+}
+
+/** Reruns the harness of every finding the edit `touched` (all that are due, when it is undefined). */
+async function rerunFindings($: $, touched?: readonly string[]): Promise<void> {
+  const all = await read($, findingsAtom)
+  const due = all.filter(f => {
+    if (!RERUN_STATUSES.has(f.status) || f.rerun === '') return false
+    if (touched === undefined) return live.staleReruns.has(f.id) || (f.status === 'applied' && !live.rerun.has(f.id))
+    return (f.files ?? []).some(file => touched.includes(file))
+  })
+  if (due.length === 0) return
+  const c = await ensureCtx($)
+  if (c === undefined) return
+  for (const finding of due) {
+    if (live.rerunning.has(finding.id)) {
+      live.staleReruns.add(finding.id)
+      continue
+    }
+    live.staleReruns.delete(finding.id)
+    await rerunFinding($, c, finding)
+  }
+}
+
+/** The project-relative path of the file a main-session edit touched; undefined outside the project. */
+function editedFile(c: Ctx, e: Record<string, unknown>): string | undefined {
+  const path = trimSlash(String(e.file_path ?? e.notebook_path ?? '')).replace(/\\/g, '/')
+  const root = c.root.replace(/\\/g, '/')
+  return path !== '' && isWithin(path, root, c.isWindows) ? path.slice(root.length + 1) : undefined
 }
 
 // ---- triggers ----------------------------------------------------------------------
@@ -1035,7 +1145,8 @@ async function apply($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
   if (finding === undefined) return `No finding #${id}.`
   if (finding.patch === '' && finding.nextStep === '') return `Finding #${id} has no fix to hand over.`
-  if (finding.status === 'handing' || finding.status === 'applied') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
+  // a regressed fix may be handed over again; one that holds may not
+  if (finding.status === 'handing' || finding.status === 'applied' || finding.status === 'fixed') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
   // marked before the handoff is scheduled: the prompt only resolves once Claude is free, and repeat presses must not queue copies
   await setStatus($, id, 'handing')
   // /stress apply's hook holds the turn a submitted prompt waits on: hand over once the command has answered
@@ -1268,6 +1379,7 @@ async function onMainTurnEnd($: $): Promise<void> {
   live.isMainBusy = false
   live.lastActivityAt = await $.clock.now()
   armIdle($)
+  await rerunFindings($).catch(() => undefined)
   await maybeSuggest($)
 }
 
@@ -1324,7 +1436,12 @@ export const register: Register = (on, options) => {
         : next(e)
     }
     const ran = await next(e)
-    if (EDIT_TOOLS.has(String(e.tool)) && ran.deny === undefined && ran.isError !== true) await noteEdit($)
+    if (EDIT_TOOLS.has(String(e.tool)) && ran.deny === undefined && ran.isError !== true) {
+      await noteEdit($)
+      const c = await ensureCtx($)
+      const file = c !== undefined ? editedFile(c, e as unknown as Record<string, unknown>) : undefined
+      if (file !== undefined) await rerunFindings($, [file]).catch(() => undefined)
+    }
     return ran
   }).catch(($, e, next) =>
     next.called

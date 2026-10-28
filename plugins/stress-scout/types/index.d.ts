@@ -28,11 +28,14 @@ export type Finding = {
   isVerified: boolean
   nextStep: string
   rerun: string
+  /** Project files (relative to the root) the finding targets: what the rerun copies into the snapshot. */
+  files: string[]
   snapshot: string
   /** Absent on findings saved by an earlier version. */
   origin?: Origin
   confidence: string
-  status: 'new' | 'handing' | 'applied' | 'dismissed'
+  /** `fixed` / `regressed`: the stored harness, rerun on the edited project files, passed / failed. */
+  status: 'new' | 'handing' | 'applied' | 'dismissed' | 'fixed' | 'regressed'
   durationMs: number
   tokens: number
   cost: number
@@ -54,6 +57,7 @@ export type Run = {
   trigger: Trigger
   target: string
   kind: string
+  files: string[]
   memoryKey: string
   hash: string
   runDir: string
