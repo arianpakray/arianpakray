@@ -1235,21 +1235,26 @@ export const register: Register = (on, options) => {
     const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.id > seenId)
     if (finding === undefined) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
+    const isGraphical = e.surface !== 'terminal'
     const delta = finding.before !== '' && finding.after !== '' ? ` (${finding.before} → ${finding.after})` : ''
+    // a graphical surface draws the band as a card edged in the verdict's theme color
+    const card = isGraphical
+      ? { borderStyle: 'round', borderColor: verdictColor(finding.verdict), paddingX: 'sm' as const, paddingY: 'xs' as const, gap: 'xs' as const }
+      : {}
     return (
-      <Box flexDirection="column">
-        <Box flexDirection="row" gap={1}>
-          <Text color={verdictColor(finding.verdict)} bold>
+      <Box flexDirection="column" {...card}>
+        <Box flexDirection="row" gap={isGraphical ? 'sm' : 1}>
+          <Text color={verdictColor(finding.verdict)} bold weight="semibold">
             {`stress-scout #${finding.id} ${finding.verdict}`}
           </Text>
-          <Text wrap="truncate-end">{`${finding.target}: ${finding.headline}`}</Text>
+          <Text wrap="truncate-end" mono={isGraphical}>{`${finding.target}: ${finding.headline}`}</Text>
         </Box>
         {finding.fixSummary !== '' && (
-          <Text dimColor wrap="truncate-end">
+          <Text dimColor wrap="truncate-end" size="footnote">
             {`${finding.isVerified ? 'verified fix' : 'unverified fix'}: ${finding.fixSummary}${delta}`}
           </Text>
         )}
-        <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" gap={isGraphical ? 'xs' : 1}>
           {finding.patch !== '' && (
             <Button key="apply" label="Apply via Claude" variant="primary" hotkey="a" onPress={() => void apply($, finding.id)} />
           )}
@@ -1263,6 +1268,8 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Code } = $.ui.resolve(e)
     const { config } = live
+    // the terminal keeps its compact rows; a graphical surface (the app, an editor, a phone) gets cards
+    const isGraphical = e.surface !== 'terminal'
     const [phase, findings, activity, runsUsed, tokens, spent, paused, openId, run] = await Promise.all([
       read($, phaseAtom),
       read($, findingsAtom),
@@ -1284,20 +1291,37 @@ export const register: Register = (on, options) => {
             : phase.kind === 'triage'
               ? 'triaging the latest change'
               : 'watching'
+    const stateColor =
+      phase.kind === 'off' ? 'error' : phase.kind === 'test' ? 'claude' : paused ? 'subtle' : phase.kind === 'triage' ? 'suggestion' : 'success'
     const mode = config.isSweeping ? 'changes + idle sweeps' : 'changes only'
+    const row = isGraphical ? ('xs' as const) : 1
+    const section = isGraphical ? ('md' as const) : 1
+    const detail = (key: string, label: string, value: string) =>
+      isGraphical ? (
+        <Box key={key} flexDirection="column">
+          <Text size="caption" weight="semibold" dimColor>
+            {label}
+          </Text>
+          <Text>{value}</Text>
+        </Box>
+      ) : (
+        <Text key={key}>{`${label}: ${value}`}</Text>
+      )
     return (
-      <Box flexDirection="column" gap={1}>
-        <Box flexDirection="column">
-          <Text bold wrap="truncate-end">{`stress-scout · ${state}`}</Text>
-          <Text dimColor wrap="truncate-end">
+      <Box flexDirection="column" gap={section}>
+        <Box flexDirection="column" gap={isGraphical ? 'xs' : 0}>
+          <Text bold weight="semibold" size="heading" color={isGraphical ? stateColor : undefined} wrap="truncate-end">
+            {`stress-scout · ${state}`}
+          </Text>
+          <Text dimColor size="footnote" tabular wrap="truncate-end">
             {`automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} · ${compactTokens(tokens)} tokens · ${mode}`}
           </Text>
         </Box>
-        <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" gap={row}>
           {run !== null ? (
             <Button key="stop" label="Stop test" onPress={() => void stopTester($)} />
           ) : (
-            <Button key="run" label="Run now" onPress={() => void runNow($)} />
+            <Button key="run" label="Run now" variant={isGraphical ? 'primary' : undefined} onPress={() => void runNow($)} />
           )}
           <Button key="pause" label={paused ? 'Resume' : 'Pause'} onPress={() => void togglePause($, !paused)} />
         </Box>
@@ -1309,51 +1333,69 @@ export const register: Register = (on, options) => {
         )}
         {findings.slice(0, 12).map(f => {
           const isOpen = openId === f.id
+          const isNew = f.status === 'new'
           const delta = f.before !== '' && f.after !== '' ? ` (${f.before} → ${f.after})` : ''
           const cost = f.cost > 0 ? ` · ${dollars(f.cost)}` : ''
+          const card = isGraphical
+            ? {
+                borderStyle: 'round',
+                borderColor: isNew ? verdictColor(f.verdict) : 'subtle',
+                borderDimColor: !isNew,
+                padding: 'sm' as const,
+                gap: 'xs' as const,
+              }
+            : {}
           return (
-            <Box key={`finding-${f.id}`} flexDirection="column">
-              <Box flexDirection="row" gap={1}>
-                <Text color={verdictColor(f.verdict)} bold>{`#${f.id} ${f.verdict}`}</Text>
-                <Text wrap="truncate-end" dimColor={f.status !== 'new'}>
-                  {`${f.target} · ${f.kind}${f.status !== 'new' ? ` · ${f.status}` : ''}`}
+            <Box key={`finding-${f.id}`} flexDirection="column" {...card}>
+              <Box flexDirection="row" gap={row}>
+                <Text color={verdictColor(f.verdict)} bold weight="semibold">{`#${f.id} ${f.verdict}`}</Text>
+                <Text wrap="truncate-end" dimColor={!isNew} mono={isGraphical}>
+                  {`${f.target} · ${f.kind}${!isNew ? ` · ${f.status}` : ''}`}
                 </Text>
               </Box>
-              <Text wrap={isOpen ? 'wrap' : 'truncate-end'}>{f.headline}</Text>
+              <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={isGraphical && !isNew}>
+                {f.headline}
+              </Text>
               {f.fixSummary !== '' && (
-                <Text dimColor wrap={isOpen ? 'wrap' : 'truncate-end'}>
+                <Text dimColor size="footnote" wrap={isOpen ? 'wrap' : 'truncate-end'}>
                   {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}
                 </Text>
               )}
               {isOpen && (
-                <Box flexDirection="column">
-                  {f.evidence !== '' && <Text>{`Evidence: ${f.evidence}`}</Text>}
-                  {f.before !== '' && <Text>{`Before: ${f.before}`}</Text>}
-                  {f.after !== '' && <Text>{`After: ${f.after}`}</Text>}
-                  {f.fixExplanation !== '' && <Text>{`Why it works: ${f.fixExplanation}`}</Text>}
-                  {f.nextStep !== '' && <Text>{`Next step: ${f.nextStep}`}</Text>}
-                  <Text dimColor>{`Harness: ${f.snapshot}/.stress-scout/${f.rerun !== '' ? `  ·  rerun: ${f.rerun}` : ''}`}</Text>
-                  <Text dimColor>{`Took ${ago(f.durationMs)} · ${compactTokens(f.tokens)} tokens${cost} · confidence ${f.confidence}`}</Text>
+                <Box flexDirection="column" gap={row}>
+                  {f.evidence !== '' && detail('evidence', 'Evidence', f.evidence)}
+                  {f.before !== '' && detail('before', 'Before', f.before)}
+                  {f.after !== '' && detail('after', 'After', f.after)}
+                  {f.fixExplanation !== '' && detail('why', 'Why it works', f.fixExplanation)}
+                  {f.nextStep !== '' && detail('next', 'Next step', f.nextStep)}
+                  <Text dimColor size="footnote" mono={isGraphical}>
+                    {`Harness: ${f.snapshot}/.stress-scout/${f.rerun !== '' ? `  ·  rerun: ${f.rerun}` : ''}`}
+                  </Text>
+                  <Text dimColor size="footnote" tabular>
+                    {`Took ${ago(f.durationMs)} · ${compactTokens(f.tokens)} tokens${cost} · confidence ${f.confidence}`}
+                  </Text>
                   {f.patch !== '' && <Code source={clip(f.patch, 12_000)} format="diff" language="diff" />}
                 </Box>
               )}
-              <Box flexDirection="row" gap={1}>
-                {f.status === 'new' && f.patch !== '' && (
+              <Box flexDirection="row" gap={row}>
+                {isNew && f.patch !== '' && (
                   <Button key={`apply-${f.id}`} label="Apply via Claude" variant="primary" onPress={() => void apply($, f.id)} />
                 )}
                 <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
-                {f.status === 'new' && (
-                  <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />
-                )}
+                {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}
               </Box>
             </Box>
           )
         })}
         {activity.length > 0 && (
-          <Box flexDirection="column">
-            <Text bold>Activity</Text>
-            {activity.slice(0, 10).map(item => (
-              <Text dimColor wrap="truncate-end">{`${clockTime(item.at)} ${item.text}`}</Text>
+          <Box flexDirection="column" gap={isGraphical ? 'xs' : 0}>
+            <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>
+              Activity
+            </Text>
+            {activity.slice(0, 10).map((item, i) => (
+              <Text key={`activity-${i}`} dimColor size="footnote" tabular wrap="truncate-end">
+                {`${clockTime(item.at)} ${item.text}`}
+              </Text>
             ))}
           </Box>
         )}
