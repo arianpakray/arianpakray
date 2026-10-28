@@ -126,6 +126,7 @@ export function testerTask(args: {
   runDir: string
   root: string
   linkedDeps: readonly string[]
+  isWindows?: boolean
 }): string {
   const lines = [
     `stress-scout run #${args.id} (${args.trigger}).`,
@@ -148,6 +149,11 @@ export function testerTask(args: {
   if (args.linkedDeps.length > 0) {
     lines.push(
       `- Linked from the real project (read-only: never write, install or cd into them): ${args.linkedDeps.join(', ')}`,
+    )
+  }
+  if (args.isWindows === true) {
+    lines.push(
+      'PLATFORM: Windows. Your Bash tool is Git Bash: write paths with forward slashes, as above (C:/...), never backslashes. Run Python as python or py -3 (python3 may be the Microsoft Store stub); a venv keeps its interpreter in .venv/Scripts/. cmd and PowerShell are not available to you.',
     )
   }
   return lines.join('\n')
