@@ -134,6 +134,8 @@ type World = {
   credential: { handle: string; kind: 'bearer' | 'api-key' } | null | 'refused'
   /** Each pane the plugin asked to open, by id. */
   opened: string[]
+  /** The testers' final reports, in the order they run; REPORT once these run out. */
+  reports: string[]
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -157,6 +159,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     rateLimits: [],
     credential: null,
     opened: [],
+    reports: [],
   }
   mock.store(on, stored)
   mock.env(on, place.env)
@@ -201,7 +204,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     yield { stream: 'stdout' as const, text: line(toolUse) + line(toolUse).slice(0, 20) }
     yield { stream: 'stdout' as const, text: line(toolUse).slice(20) }
     yield { stream: 'stderr' as const, text: 'warming up\n' }
-    yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: REPORT, total_cost_usd: 0.42, usage: USAGE }) }
+    yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: w.reports.shift() ?? REPORT, total_cost_usd: 0.42, usage: USAGE }) }
     return { value: { code: 0, signal: null } }
   } as never)
   on('model.complete', ($, e) => {
@@ -429,6 +432,30 @@ test('openPaneOnStart off leaves the pane to /stress show', { timeoutMs: 30_000,
   expect(w.opened).toEqual([])
   await $.command.run(stress('show') as never)
   expect(w.opened).toEqual(['stress-scout'])
+})
+
+test('a newer unverified finding does not hold back an older verified fix', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+
+  // the person starts a turn, which holds the hand-off; a focused run meanwhile finds something unverified
+  await $.turn.start({ turnId: 't1' } as never)
+  w.reports.push(REPORT.replace('"verified":true', '"verified":false').replace('evict before the await', 'unverified guess'))
+  await $.command.run(stress('the retry loop in api/client.ts') as never)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(2)
+  await $.turn.complete({ turnId: 't1', answer: '' } as never)
+
+  await clock.advance(30_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+  expect(w.submitted[0]?.text).toMatch(/^Apply stress-scout fix #1: evict before the await\n/)
 })
 
 test('the pane says what the next automatic run waits on', { timeoutMs: 30_000 }, async ($, on) => {

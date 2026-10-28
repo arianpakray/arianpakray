@@ -835,11 +835,13 @@ async function cleanupRuns($: $, c: Ctx): Promise<void> {
 async function maybeSuggest($: $): Promise<void> {
   if (live.isMainBusy) return
   const [findings, suggested] = await Promise.all([read($, findingsAtom), read($, suggestedAtom)])
-  const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
-  if (finding === undefined) return
+  const pending = findings.filter(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
+  // a verified fix is handed over even when a newer, unverified one waits for approval
+  const verified = pending.find(f => f.isVerified)
+  if (live.config.isAutoApplying && verified !== undefined) armAutoApply($, verified.id)
   // the suggestion still shows while an automatic hand-off waits, so the person sees what is coming
-  if (live.config.isAutoApplying && finding.isVerified) armAutoApply($, finding.id)
-  if (finding.id === suggested) return
+  const finding = pending[0]
+  if (finding === undefined || finding.id === suggested) return
   const shown = await $.prompt.suggest({ text: handoffPrompt(finding) }).catch(() => ({ isShown: false }))
   if (shown.isShown) await update($, suggestedAtom, () => finding.id)
 }
