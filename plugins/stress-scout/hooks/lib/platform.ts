@@ -140,6 +140,22 @@ export async function removeTree($: EngineInterface, path: string, isWindows: bo
   return (await powershell($, removeTreeScript(path), timeoutMs)).exitCode === 0
 }
 
+/**
+ * Creates file `path` holding `text`, failing when it already exists: one atomic
+ * create (O_EXCL through the shell's noclobber; CreateNew on Windows), so of two
+ * processes racing for it exactly one wins. True when this call created it.
+ */
+export async function createExclusive($: EngineInterface, path: string, text: string, isWindows: boolean): Promise<boolean> {
+  if (!isWindows) {
+    return (await $.process.run(['sh', '-c', 'set -C; printf %s "$1" > "$2"', 'sh', text, path], { timeoutMs: 10_000 })).exitCode === 0
+  }
+  const script = [
+    `try { $f = [IO.File]::Open(${psQuote(path.replace(/\//g, '\\'))}, 'CreateNew', 'Write') } catch { exit 1 }`,
+    `$b = [Text.Encoding]::UTF8.GetBytes(${psQuote(text)}); $f.Write($b, 0, $b.Length); $f.Close()`,
+  ].join('\n')
+  return (await powershell($, script, 30_000)).exitCode === 0
+}
+
 /** Links folder `link` to `target`: a symbolic link, or on Windows a junction (no admin rights needed). */
 export async function linkFolder($: EngineInterface, target: string, link: string, isWindows: boolean): Promise<boolean> {
   if (!isWindows) return (await $.process.run(['ln', '-s', target, link])).exitCode === 0

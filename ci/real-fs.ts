@@ -8,7 +8,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
-import { linkFolder, removeTree } from '../plugins/stress-scout/hooks/lib/platform.ts'
+import { createExclusive, linkFolder, removeTree } from '../plugins/stress-scout/hooks/lib/platform.ts'
 import { fingerprintOrRebuild, makeSnapshot, openShadow, patchOf, ShadowLocked } from '../plugins/stress-scout/hooks/lib/shadow.ts'
 
 const isWindows = process.platform === 'win32'
@@ -42,6 +42,7 @@ const $ = {
       writeFileSync(path, text)
     },
     exists: async (path: string) => existsSync(path),
+    read: async (path: string) => readFileSync(path, 'utf8'),
     stat: async (path: string, options?: { resolve?: boolean }) => {
       const stat = statSync(path)
       return {
@@ -57,6 +58,22 @@ const $ = {
   clock: { now: async () => Date.now(), sleep: (ms: number) => new Promise(resolve => setTimeout(resolve, ms)) },
   env: { get: async (name: string) => process.env[name] },
 } as never
+
+// `bun ci/real-fs.ts race <root> <scratch> <rounds>`: one of several sessions opening one scratch at once
+if (process.argv[2] === 'race') {
+  const [root, scratch, rounds] = [process.argv[3] ?? '', process.argv[4] ?? '', Number(process.argv[5])]
+  let failures = 0
+  for (let i = 0; i < rounds; i++) {
+    try {
+      await fingerprintOrRebuild($, await openShadow($, root, scratch))
+    } catch (error) {
+      failures++
+      console.error(String(error).slice(0, 200))
+    }
+  }
+  console.log(failures)
+  process.exit(0)
+}
 
 let failures = 0
 function check(what: string, isTrue: boolean, detail = ''): void {
@@ -135,6 +152,27 @@ rmSync(join(scratch, 'shadow.git', 'objects'), { recursive: true, force: true })
 const rebuilt = await fingerprintOrRebuild($, shadow)
 shadow = rebuilt.shadow
 check('a damaged shadow is rebuilt to the same tree', rebuilt.tree === first.tree)
+
+// sessions in one project share the scratch: its lock orders them across processes
+const scratchLock = join(scratch, 'shadow.lock')
+const tokens = await Promise.all([1, 2, 3, 4].map(n => createExclusive($, join(base, 'race.lock'), `p${n}`, isWindows)))
+check('of four racing creates, exactly one wins', tokens.filter(Boolean).length === 1)
+write(scratchLock, 'another-session')
+const heldAt = Date.now()
+setTimeout(() => rmSync(scratchLock), 1500)
+const waited = await fingerprintOrRebuild($, shadow)
+check('a held scratch lock is waited for', waited.tree === first.tree && Date.now() - heldAt >= 1400, `${Date.now() - heldAt} ms`)
+check('the scratch lock is let go', !existsSync(scratchLock))
+write(scratchLock, 'a-killed-session')
+utimesSync(scratchLock, old, old)
+check('a stale scratch lock is broken', (await fingerprintOrRebuild($, shadow)).tree === first.tree && !existsSync(scratchLock))
+const raceScratch = join(base, 'race-scratch')
+const { run } = ($ as { process: { run: (argv: readonly string[], init: RunInit) => Promise<{ exitCode: number; stdout: string }> } }).process
+const workers = await Promise.all(
+  [1, 2, 3, 4, 5, 6].map(() => run([process.execPath, join(import.meta.dir, 'real-fs.ts'), 'race', root, raceScratch, '4'], { timeoutMs: 300_000 })),
+)
+const raceFailures = workers.reduce((sum, w) => sum + (Number(w.stdout.trim()) || 0) + (w.exitCode === 0 ? 0 : 4), 0)
+check('six sessions opening one fresh scratch at once all succeed', raceFailures === 0, `${raceFailures}/24 failed`)
 
 // deep paths: past Windows' 260-character limit inside the snapshot
 const deep = join(root, ...Array.from({ length: 10 }, (_, i) => `a-rather-long-folder-name-${i}`), 'deep.txt')
