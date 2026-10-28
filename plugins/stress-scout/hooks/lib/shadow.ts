@@ -197,6 +197,24 @@ async function projectGit($: EngineInterface, root: string, args: readonly strin
   })
 }
 
+/** The project's branch (empty when detached) and short HEAD; both empty outside git or before a first commit. */
+export async function projectHead($: EngineInterface, root: string): Promise<{ branch: string; head: string }> {
+  const head = await projectGit($, root, ['rev-parse', '--short', 'HEAD'])
+  if (head.exitCode !== 0) return { branch: '', head: '' }
+  const branch = await projectGit($, root, ['symbolic-ref', '-q', '--short', 'HEAD'])
+  return { branch: branch.exitCode === 0 ? branch.stdout.trim() : '', head: head.stdout.trim() }
+}
+
+/** Blob ids of `paths` as the project holds them now, hashed the way the shadow stores them; a missing file is left out. */
+export async function worktreeBlobs($: EngineInterface, shadow: Shadow, paths: readonly string[]): Promise<Map<string, string>> {
+  const blobs = new Map<string, string>()
+  for (const path of paths) {
+    const out = await git($, shadow, ['hash-object', '--', path], { isTolerant: true })
+    if (out.exitCode === 0 && out.stdout.trim() !== '') blobs.set(path, out.stdout.trim())
+  }
+  return blobs
+}
+
 /**
  * Opens (creating on first use) the shadow repository for `root` under `scratch`.
  * Like every write to the shadow, it waits for the one before it on that scratch:

@@ -42,7 +42,9 @@ import {
   makeSnapshot,
   openShadow,
   patchOf,
+  projectHead,
   type Shadow,
+  worktreeBlobs,
 } from './lib/shadow'
 import { homeFolder, isWindowsPath, portable, removeTree, tempRoot, windowsCanonical } from './lib/platform'
 import { ago, basename, clip, clockTime, compactTokens, fnv, isInside, oneLine, slug, trimSlash } from './lib/util'
@@ -654,6 +656,7 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
   const startedAt = await $.clock.now()
   const runDir = `${c.scratch}/runs/run-${String(args.id).padStart(4, '0')}-${startedAt}`
   const { snapshot, linked } = await makeSnapshot($, c.shadow, args.tree, runDir)
+  const { branch, head } = await projectHead($, c.root)
   const run: Run = {
     id: args.id,
     trigger: args.trigger,
@@ -663,6 +666,8 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
     hash: args.hash,
     runDir,
     snapshot,
+    branch,
+    head,
     baseTree: args.tree,
     startedAt,
     tokens: args.tokens,
@@ -909,6 +914,9 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
       await log($, `#${run.id}: could not read the fix back: ${messageOf(error)}`)
     }
   }
+  // the files the fix touches, as the snapshot held them: the handoff checks them against the project then
+  const targeted = report?.fix?.files.length ? report.fix.files : [(report?.target || run.target).replace(/:.*$/, '')]
+  const files = c !== undefined ? await blobsOf($, c.shadow, run.baseTree, targeted).catch(() => new Map<string, string>()) : new Map<string, string>()
   const patchPath = patch !== '' ? `${run.runDir}/fix.patch` : ''
   if (patchPath !== '') await $.fs.write(patchPath, `${patch}\n`)
   const finding: Finding = {
@@ -930,6 +938,7 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
     confidence: report?.confidence ?? 'low',
     tokens: run.tokens + outcome.tokens,
     cost: outcome.cost,
+    origin: { branch: run.branch, head: run.head, files: Object.fromEntries(files) },
   }
   await update($, findingsAtom, list => [finding, ...list.filter(f => f.id !== finding.id)].slice(0, 25))
   await update($, tokensAtom, n => n + outcome.tokens)
@@ -1022,10 +1031,32 @@ async function apply($: $, id: number): Promise<string> {
   return `Handing finding #${id} to Claude.`
 }
 
+/**
+ * What differs between the project now and where the finding was made: a line
+ * for the branch or commit, a line for the files the patch touches. '' when nothing does.
+ */
+async function driftNote($: $, finding: Finding): Promise<string> {
+  const origin = finding.origin
+  const c = await ensureCtx($)
+  if (origin === undefined || c === undefined) return ''
+  const label = (at: { branch: string; head: string }): string => (at.branch !== '' ? `${at.branch}@${at.head}` : at.head)
+  const notes: string[] = []
+  const now = await projectHead($, c.root)
+  if (origin.head !== '' && now.head !== '' && (now.head !== origin.head || now.branch !== origin.branch)) {
+    notes.push(`Made against ${label(origin)}; you're on ${label(now)}.`)
+  }
+  const paths = Object.keys(origin.files)
+  const current = await worktreeBlobs($, c.shadow, paths).catch(() => undefined)
+  // a file gone from the project counts as changed too
+  const changed = current === undefined ? [] : paths.filter(path => current.get(path) !== origin.files[path])
+  if (changed.length > 0) notes.push(`${changed.join(', ')} ${changed.length === 1 ? 'has' : 'have'} changed since the snapshot.`)
+  return notes.join('\n')
+}
+
 /** Submits the handoff as the person's prompt; the finding counts as applied once it entered. */
 async function handOff($: $, finding: Finding): Promise<void> {
   try {
-    const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now()), asUser: true })
+    const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now(), await driftNote($, finding)), asUser: true })
     if (entered.drop !== undefined) {
       await log($, `#${finding.id} was not handed over: ${entered.drop}`)
       return
@@ -1219,7 +1250,7 @@ async function handoff($: $, id: number): Promise<string | undefined> {
   if (finding === undefined) return undefined
   await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status: 'applied' as const } : f)))
   await update($, seenAtom, seen => Math.max(seen, id))
-  return handoffContext(finding, await $.clock.now())
+  return handoffContext(finding, await $.clock.now(), 30_000, await driftNote($, finding))
 }
 
 // ---- the hooks -------------------------------------------------------------------------
