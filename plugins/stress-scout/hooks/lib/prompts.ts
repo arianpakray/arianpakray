@@ -168,14 +168,15 @@ export const HANDOFF = /^\s*apply stress-scout fix #(\d+)\b/i
 /** Marks a prompt that already carries a finding's details, so they are never attached twice. */
 export const HANDOFF_DETAILS = 'stress-scout finding #'
 
-/** The handoff as one message: the instruction, then the details (what the Apply button sends). */
-export const handoffMessage = (finding: Finding, now: number): string =>
-  `${handoffPrompt(finding)}\n\n${handoffContext(finding, now, 8_000)}`
+/** The handoff as one message: any drift note, the instruction, then the details (what the Apply button sends). */
+export const handoffMessage = (finding: Finding, now: number, drift = ''): string =>
+  `${drift !== '' ? `${drift}\n` : ''}${handoffPrompt(finding)}\n\n${handoffContext(finding, now, 8_000)}`
 
 /** What the coding agent reads beside the handoff prompt. */
-export function handoffContext(finding: Finding, now: number, maxPatch = 30_000): string {
+export function handoffContext(finding: Finding, now: number, maxPatch = 30_000, drift = ''): string {
   const patch = finding.patch.trim()
   return [
+    ...(drift !== '' ? [drift] : []),
     `${HANDOFF_DETAILS}${finding.id}: ${finding.verdict.toUpperCase()} (${finding.kind}) on ${finding.target}`,
     finding.headline,
     `Evidence: ${finding.evidence || '(none recorded)'}`,
@@ -184,7 +185,8 @@ export function handoffContext(finding: Finding, now: number, maxPatch = 30_000)
       ? `After the fix (same harness, on the snapshot): ${finding.after} — ${finding.isVerified ? 'verified' : 'NOT verified'}`
       : `After the fix: not measured${finding.isVerified ? '' : ' (fix not verified)'}`,
     `Fix: ${finding.fixSummary}${finding.fixExplanation ? ` — ${finding.fixExplanation}` : ''}`,
-    `Harness, in stress-scout's scratch folder outside this project: ${finding.snapshot}/.stress-scout/ (rerun from ${finding.snapshot}: ${finding.rerun || 'see the harness files'})`,
+    `Harness, in stress-scout's scratch folder outside this project: ${finding.snapshot}/.stress-scout/`,
+    finding.rerun ? `Rerun it with: cd ${finding.snapshot} && ${finding.rerun}` : 'No rerun command was recorded; see the harness files.',
     `Suggested next step: ${finding.nextStep || '(none)'}`,
     `The patch below was made against a snapshot taken ${ago(now - finding.at)} ago; if the code has changed since, adapt it rather than forcing it.`,
     patch !== ''
