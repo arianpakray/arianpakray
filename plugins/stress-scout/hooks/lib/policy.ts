@@ -491,6 +491,12 @@ export function commandOf(tokens: readonly Token[]): { word: string; args: strin
       while (i < words.length && /^(-|\d+$)/.test(words[i] ?? '')) i++
       continue
     }
+    if (name === 'xargs') {
+      // `xargs -I {} git push {}` runs git: step past its flags, and the value of those that take one
+      i++
+      while (i < words.length && (words[i] ?? '').startsWith('-')) i += /^-[IdEaLnPs]$/.test(words[i] ?? '') ? 2 : 1
+      continue
+    }
     if (name === 'timeout') {
       i++
       while (i < words.length && (words[i] ?? '').startsWith('-')) {
@@ -616,9 +622,49 @@ export function checkBash(command: string, sandbox: Sandbox, depth = 0): Check {
   return bashCheck(command, boxOf(sandbox), depth)
 }
 
+/** Bodies of `$(...)`, `<(...)`, `>(...)` and backtick substitutions that run, outermost first; none inside single quotes. */
+function substitutionsOf(text: string): string[] {
+  const found: string[] = []
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i] ?? ''
+    if (char === '\\' && quote !== "'") {
+      i++
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'") quote = ''
+      continue
+    }
+    if (char === "'" && quote === '') quote = "'"
+    else if (char === '"') quote = quote === '"' ? '' : '"'
+    else if (char === '`') {
+      let end = i + 1
+      while (end < text.length && text[end] !== '`') end += text[end] === '\\' ? 2 : 1
+      found.push(text.slice(i + 1, end))
+      i = end
+    } else if (text[i + 1] === '(' && text[i + 2] !== '(' && (char === '$' || (quote === '' && (char === '<' || char === '>')))) {
+      // `$((..))` is arithmetic and runs nothing
+      let level = 0
+      let end = i + 1
+      for (; end < text.length; end++) {
+        if (text[end] === '(') level++
+        else if (text[end] === ')' && --level === 0) break
+      }
+      found.push(text.slice(i + 2, end))
+      i += 1
+    }
+  }
+  return found
+}
+
 function bashCheck(command: string, box: Box, depth: number): Check {
   if (depth > 3) return deny('command nests too deeply to check')
   const text = stripDataHeredocs(command)
+  for (const body of substitutionsOf(text)) {
+    const nested = bashCheck(body, box, depth + 1)
+    if (!nested.isAllowed) return nested
+  }
   const word = '(?:^|[\\s;&|(`])'
 
   if (new RegExp(`${word}(sudo|doas|su)(\\s|$)`).test(text)) return deny('no sudo, doas or su')
