@@ -352,6 +352,14 @@ function segmentsOf(command: string): Segment[] {
       current += char
       continue
     }
+    if (char === '$' && command[i + 1] === "'") {
+      // $'..' honours \' inside, so `$'\'';` ends the string before the `;`
+      let end = i + 2
+      while (end < command.length && command[end] !== "'") end += command[end] === '\\' ? 2 : 1
+      current += command.slice(i, end + 1)
+      i = end
+      continue
+    }
     if (char === '"' || char === "'") {
       quote = char
       current += char
@@ -636,23 +644,40 @@ function substitutionsOf(text: string): string[] {
       if (char === "'") quote = ''
       continue
     }
-    if (char === "'" && quote === '') quote = "'"
+    if (char === '$' && text[i + 1] === "'" && quote === '') {
+      // $'..' honours \' inside
+      i += 2
+      while (i < text.length && text[i] !== "'") i += text[i] === '\\' ? 2 : 1
+    } else if (char === "'" && quote === '') quote = "'"
     else if (char === '"') quote = quote === '"' ? '' : '"'
     else if (char === '`') {
       let end = i + 1
       while (end < text.length && text[end] !== '`') end += text[end] === '\\' ? 2 : 1
-      found.push(text.slice(i + 1, end))
+      // inside backticks \` \$ and \\ are escapes of the outer level
+      found.push(text.slice(i + 1, end).replace(/\\([`$\\])/g, '$1'))
       i = end
-    } else if (text[i + 1] === '(' && text[i + 2] !== '(' && (char === '$' || (quote === '' && (char === '<' || char === '>')))) {
-      // `$((..))` is arithmetic and runs nothing
+    } else if (text[i + 1] === '(' && (char === '$' || (quote === '' && (char === '<' || char === '>')))) {
+      // `$((..))` is arithmetic only when it parses as such, else bash runs a subshell: its body is checked too
       let level = 0
       let end = i + 1
+      // the quote the body is inside: ' and " as in the shell, $ for $'..', where \' escapes
+      let inner = ''
       for (; end < text.length; end++) {
-        if (text[end] === '(') level++
-        else if (text[end] === ')' && --level === 0) break
+        const c = text[end] ?? ''
+        if (inner !== '') {
+          if (c === '\\' && inner !== "'") end++
+          else if (c === "'" && inner === '$') inner = ''
+          else if (c === inner) inner = ''
+        } else if (c === '\\') end++
+        else if (c === '$' && text[end + 1] === "'") {
+          inner = '$'
+          end++
+        } else if (c === "'" || c === '"') inner = c
+        else if (c === '(') level++
+        else if (c === ')' && --level === 0) break
       }
       found.push(text.slice(i + 2, end))
-      i += 1
+      i = end
     }
   }
   return found

@@ -23,6 +23,8 @@ describe('the tester may do its job inside the sandbox', () => {
     'echo "process.env.NODE_ENV"',
     'timeout -s KILL 60 node .stress-scout/a.js',
     'echo $((1 + 2))',
+    'echo $(( (1+2)*3 ))',
+    'echo "$(( 2 ** 3 ))"',
     "echo '$(git push)'",
     'x=$(cat .stress-scout/a.txt) && echo "$x"',
     'ls .stress-scout | xargs -n 1 echo',
@@ -113,6 +115,16 @@ describe('the guard refuses what could hurt the project, secrets or the machine'
     'ls | xargs -n 1 git push',
     'ls | xargs -I {} git push {}',
     "ls | xargs -d '\\n' rm -rf /work/proj",
+    // bash runs these, as stress-scout's own harness showed with git stubbed: $(( that is no arithmetic is a
+    // subshell, a quoted ) does not close, $'\'' does not open a quote, and backticks nest one escape deeper
+    'echo $((git push) )',
+    'echo $((git push); echo x)',
+    'echo "$((true);git push)"',
+    'echo "$(echo ")"; git push)"',
+    'echo "$(echo \\); git push)"',
+    "echo $'\\'' $(git push)",
+    'echo `echo \\`git push\\``',
+    "echo $(echo $'\\')'; git push)",
     // node_modules, .venv and the like are links into the real project
     'rm -rf node_modules/../src',
     `echo x > ${RUN}/snapshot/node_modules/../src/a.ts`,
