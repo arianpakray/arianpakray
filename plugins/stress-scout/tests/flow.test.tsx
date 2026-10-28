@@ -134,6 +134,8 @@ type World = {
   credential: { handle: string; kind: 'bearer' | 'api-key' } | null | 'refused'
   /** Each pane the plugin asked to open, by id. */
   opened: string[]
+  /** what $.session.surfaces() answers: one attached window unless a test empties it */
+  surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
 }
@@ -159,6 +161,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     rateLimits: [],
     credential: null,
     opened: [],
+    surfaces: ['desktop'],
     reports: [],
   }
   mock.store(on, stored)
@@ -220,6 +223,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     w.toasts.push(e.text)
     return { value: undefined }
   })
+  on('session.surfaces', () => ({ value: w.surfaces }))
   on('ui.open', ($, e) => {
     w.opened.push(e.id)
     return { value: { isPlaced: true as const } }
@@ -423,6 +427,22 @@ test('the pane opens by itself when a session starts', { timeoutMs: 30_000 }, as
   const w = world(on)
   await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
   expect(w.opened).toEqual(['stress-scout'])
+})
+
+test('a session with no surface attached does not try to place the pane', { timeoutMs: 30_000 }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  w.surfaces = []
+  await $.session.start({ cwd: ROOT, surface: null, isInteractive: false })
+  expect(w.opened).toEqual([])
+})
+
+test('/stress start runs a test, as /stress run does', { timeoutMs: 30_000 }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  world(on)
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  const started = await $.command.run(stress('start') as never)
+  expect(started.text).toContain('Stress-testing the latest change')
 })
 
 test('openPaneOnStart off leaves the pane to /stress show', { timeoutMs: 30_000, options: { openPaneOnStart: false } }, async ($, on) => {

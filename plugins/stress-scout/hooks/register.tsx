@@ -1087,6 +1087,8 @@ async function runNow($: $, focus?: string): Promise<string> {
 /** openPaneOnStart: a session with no surface yet (the app, the SDK) is tried again when its first turn starts. */
 async function autoOpenPane($: $): Promise<void> {
   if (!live.config.isOpeningPane || live.isPaneShown) return
+  // with nothing attached (a -p run, an SDK host) ui.open has nowhere to place it and the engine logs an error
+  if ((await $.session.surfaces()).length === 0) return
   const opened = await $.ui.open({ id: PANE, title: 'Stress Scout' }).catch(() => ({ isPlaced: false }))
   live.isPaneShown = opened.isPlaced
 }
@@ -1140,7 +1142,7 @@ async function statusText($: $): Promise<string> {
 }
 
 const HELP = [
-  '/stress            stress-test the latest change now (a sweep when nothing changed)',
+  '/stress            stress-test the latest change now (a sweep when nothing changed; also /stress run or start)',
   '/stress <focus>    stress-test something specific, e.g. /stress the retry logic in api/client.ts',
   '/stress show       open the Stress Scout pane',
   '/stress status     what it is doing and what it found',
@@ -1157,6 +1159,7 @@ async function runCommand($: $, args: string): Promise<string> {
     case '':
     case 'now':
     case 'run':
+    case 'start':
       return runNow($)
     case 'show':
     case 'pane':
