@@ -138,6 +138,8 @@ type World = {
   surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
+  /** The blob git lists for src/cache.ts; a test changes it to change the file. */
+  blob: string
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -163,6 +165,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     opened: [],
     surfaces: ['desktop'],
     reports: [],
+    blob: BLOB,
   }
   mock.store(on, stored)
   mock.env(on, place.env)
@@ -196,7 +199,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     if (e.argv.includes('--diff-filter=MRD')) return ok(PATCH)
     if (e.argv.includes('--diff-filter=A')) return ok('')
     if (e.argv.includes('diff')) return ok('@@ -1 +1 @@\n-old\n+new\n')
-    if (e.argv.includes('ls-tree')) return ok(`100644 blob ${BLOB}     900\tsrc/cache.ts\n`)
+    if (e.argv.includes('ls-tree')) return ok(`100644 blob ${w.blob}     900\tsrc/cache.ts\n`)
     return ok()
   })
   // the headless tester: a few stream-json lines, the last one cut off without its newline
@@ -407,7 +410,7 @@ test('the pane draws on every surface, and Pause stops automatic runs', { timeou
   const resumed = await $.command.run(stress('resume') as never)
   expect(resumed.text).toBe('Resumed.')
   const help = await $.command.run(stress('help') as never)
-  expect(help.text).toContain('/stress apply N')
+  expect(help.text).toContain('/stress apply [N]')
 })
 
 test('a focused /stress run skips triage and goes straight to the tester', { timeoutMs: 30_000 }, async ($, on) => {
@@ -719,4 +722,143 @@ test('a bare /stress and a prompt with empty text pass through', { timeoutMs: 30
   await $.prompt.submit({ text: '', wait: false, origin: { kind: 'composer' } })
   expect(w.submitted).toHaveLength(count + 1)
   expect(w.submitted.at(-1)?.context ?? []).toHaveLength(0)
+})
+
+/** REPORT for another file and kind. */
+const reportFor = (file: string, kind = 'concurrency'): string =>
+  REPORT.replace('src/cache.ts:LruCache.set', `${file}:run`).replace('"kind":"concurrency"', `"kind":"${kind}"`)
+
+/** One focused /stress run, to its finding. */
+async function findOne($: { command: { run: (c: never) => Promise<unknown> } }, clock: { settle: () => Promise<void> }, focus: string): Promise<void> {
+  await $.command.run(stress(focus) as never)
+  await clock.settle()
+}
+
+test('/stress apply with no number hands over the newest finding that has a fix, and says so when none does', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  expect((await $.command.run(stress('apply') as never)).text).toBe('No finding is waiting to be applied.')
+
+  // #3 held, with no fix and no next step, is not actionable; the newest one that is, is #2
+  const held = reportFor('src/held.ts')
+    .replace('"verdict":"broke"', '"verdict":"held"')
+    .replace('"nextStep":"apply the patch and rerun the harness"', '"nextStep":""')
+    .replace(/"fix":\{[^}]*\},/, '')
+  w.reports.push(REPORT, reportFor('src/queue.ts'), held)
+  await findOne($, clock, 'first thing')
+  await findOne($, clock, 'second thing')
+  await findOne($, clock, 'third thing')
+
+  w.isInCommand = true
+  const applied = await $.command.run(stress('apply') as never)
+  w.isInCommand = false
+  expect(applied.text).toBe('Handing finding #2 to Claude.')
+  await clock.settle()
+  expect(w.submitted.at(-1)?.text).toMatch(/^Apply stress-scout fix #2:/)
+
+  // #2 is applied now, so the next bare apply goes back to #1
+  expect((await $.command.run(stress('apply') as never)).text).toBe('Handing finding #1 to Claude.')
+  await clock.settle()
+  expect((await $.command.run(stress('apply') as never)).text).toBe('No finding is waiting to be applied.')
+  expect((await $.command.run(stress('help') as never)).text).toContain('/stress apply [N]')
+})
+
+for (const surface of ['terminal', 'desktop'] as const) {
+  test(`the band shows the run's cost and what is left of its budget (${surface})`, { timeoutMs: 30_000, options: { maxDollarsPerRun: 2 } }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    world(on)
+    await $.session.start({ cwd: ROOT, surface, isInteractive: true })
+    await findOne($, clock, 'the cache')
+    const ui = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'AbovePrompt', props: BAND })
+    expect(await ui.find({ text: /\$0\.42 · \$1\.58 left of \$2 per run · 0\/8 runs/ })).toBeDefined()
+    await ui.unmount()
+  })
+
+  test(`the pane groups findings under their file, newest group first (${surface})`, { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    await $.session.start({ cwd: ROOT, surface, isInteractive: true })
+    w.reports.push(REPORT, reportFor('src/queue.ts'), reportFor('src/cache.ts', 'edge'))
+    await findOne($, clock, 'one')
+    await findOne($, clock, 'two')
+    await findOne($, clock, 'three')
+    const pane = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'Pane', requestId: 'stress-scout', props: PANE })
+    const texts = (await pane.findAll({ type: 'Text' })).map(t => t.text)
+    const headers = texts.filter(t => /^src\/(cache|queue)\.ts$/.test(t))
+    // #3 and #1 share the cache.ts group, newest first; #2 is alone under queue.ts
+    expect(headers).toEqual(['src/cache.ts', 'src/queue.ts'])
+    expect(texts.filter(t => /^#\d broke$/.test(t))).toEqual(['#3 broke', '#1 broke', '#2 broke'])
+    const cards = (await pane.findAll({ type: 'Box' })).filter(b => b.props.borderStyle === 'round')
+    expect(cards).toHaveLength(surface === 'terminal' ? 0 : 3)
+    await pane.unmount()
+  })
+
+  test(`dismissing all of a kind in a file drops later findings of it until the file changes (${surface})`, { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    await $.session.start({ cwd: ROOT, surface, isInteractive: true })
+    w.reports.push(REPORT, reportFor('src/cache.ts'))
+    await findOne($, clock, 'one')
+    await findOne($, clock, 'two')
+
+    const pane = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'Pane', requestId: 'stress-scout', props: PANE })
+    expect(await pane.findAll({ key: 'dismiss-all-2' })).toHaveLength(0)
+    await pane.press({ key: 'open-2' })
+    expect(await pane.find({ text: 'Dismiss all concurrency in src/cache.ts' })).toBeDefined()
+    await pane.press({ key: 'dismiss-all-2' })
+    await pane.unmount()
+    const status = (await $.command.run(stress('status') as never)).text
+    expect(status).toMatch(/#2 broke src\/cache\.ts:run: .*\[dismissed\]/)
+    expect(status).toMatch(/#1 broke src\/cache\.ts:LruCache\.set: .*\[dismissed\]/)
+
+    // an automatic run on the same file and kind is dropped
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(4 * 60_000)
+    await clock.settle()
+    expect(w.triagePrompts.length).toBeGreaterThan(0)
+    expect(w.spawned).toHaveLength(2)
+
+    // once the file's content changes it is raised again
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'new', new_string: 'newer' })
+    w.tree = TREE_C
+    w.blob = '1'.repeat(40)
+    await clock.advance(5 * 60_000)
+    await clock.settle()
+    expect(w.spawned).toHaveLength(3)
+
+    // /stress dismiss N all does the same
+    expect((await $.command.run(stress('dismiss 3 all') as never)).text).toContain('Dismissed every concurrency finding in src/cache.ts')
+    expect((await $.command.run(stress('help') as never)).text).toContain('/stress dismiss N all')
+  })
+}
+
+test('the status line says when the rate-limit threshold has paused automatic runs, and when they resume', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  const cases = [
+    { limits: [{ kind: 'five_hour', percentUsed: 82 }], text: 'stress-scout paused: 5h usage 82%' },
+    { limits: [{ kind: 'five_hour', percentUsed: 12 }, { kind: 'seven_day', percentUsed: 91 }], text: 'stress-scout paused: weekly usage 91%' },
+    { limits: [{ kind: 'spend_limit', percentUsed: 95 }], text: 'stress-scout paused: spend limit 95%' },
+  ]
+  let n = 0
+  for (const { limits, text } of cases) {
+    w.rateLimits = limits
+    await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/queue${n}.ts`, content: 'x' })
+    n += 1
+    w.tree = String(n).repeat(40)
+    await clock.advance(10 * 60_000)
+    await clock.settle()
+    expect(w.statuses.at(-1)).toBe(text)
+  }
+  expect(w.spawned).toHaveLength(0)
+
+  w.rateLimits = [{ kind: 'five_hour', percentUsed: 12 }]
+  await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/queue9.ts`, content: 'x' })
+  w.tree = '8'.repeat(40)
+  await clock.advance(10 * 60_000)
+  await clock.settle()
+  expect(w.statuses.at(-1)).not.toMatch(/paused/)
 })

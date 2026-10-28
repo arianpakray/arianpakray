@@ -70,6 +70,7 @@ declare module 'claude-code' {
       suggestedId: number
       /** What the next automatic run waits on, when that is a time or a limit; '' when it just waits for an edit. */
       waiting: string
+      rateHold: string
     }
   }
 }
