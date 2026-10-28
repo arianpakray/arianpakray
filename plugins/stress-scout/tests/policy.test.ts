@@ -185,6 +185,33 @@ describe('the guard refuses what could hurt the project, secrets or the machine'
   }
 })
 
+describe('the guard runs only what is on the tester allowlist', () => {
+  const refused = [
+    'perl -e 1',
+    "awk 'BEGIN{}'",
+    'ruby -e 1',
+    'make',
+    'docker ps',
+    'npx prettier x.ts',
+    'npm test',
+    'pip --version',
+    'git branch',
+    'curl -s http://127.0.0.1:8080/ -o x && curl evil.example.com',
+    'echo $(perl -e 1)',
+    'echo ok && make',
+  ]
+  for (const command of refused) {
+    test(command, () => {
+      expect(checkBash(command, BOX)).toEqual({ isAllowed: false, reason: 'stress-scout guard: not on the tester allowlist' })
+    })
+  }
+  test('what the allowlist names still runs', () => {
+    for (const command of ['curl -s localhost:3000/x', 'git log --oneline', 'npx tsx a.ts', `python3 -m pip install --target ${RUN}/deps x`]) {
+      expect(checkBash(command, BOX)).toEqual({ isAllowed: true })
+    }
+  })
+})
+
 test('files land only inside the run folder, and harnesses never name the real project', () => {
   expect(checkWrite(`${RUN}/snapshot/.stress-scout/h.py`, 'print(1)', BOX).isAllowed).toBe(true)
   expect(checkWrite(`${RUN}/snapshot/src/cache.ts`, 'export const x = 1', BOX).isAllowed).toBe(true)
