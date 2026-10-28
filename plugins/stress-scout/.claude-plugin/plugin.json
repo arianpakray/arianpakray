@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
@@ -72,6 +72,18 @@
       "title": "Max dollars per test run",
       "description": "The tester stops when one run reaches this cost (claude --max-budget-usd).",
       "default": 2
+    },
+    "openPaneOnStart": {
+      "type": "boolean",
+      "title": "Open the Stress Scout pane in every session",
+      "description": "Open the pane when a session starts (or when the app first attaches to it). Close it any time; /stress show brings it back.",
+      "default": true
+    },
+    "autoApplyVerifiedFixes": {
+      "type": "boolean",
+      "title": "Hand verified fixes to Claude automatically",
+      "description": "When a test proves its own fix and the session has been idle for the idle seconds, send the fix to Claude without a tap.",
+      "default": true
     },
     "claudePath": {
       "type": "string",
