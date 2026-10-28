@@ -1211,6 +1211,12 @@ async function onSessionStart($: $): Promise<void> {
     // the tester process ended with the module it belonged to
     await finishRun($, stale, { answer: '', cost: 0, tokens: 0, failure: 'interrupted: stress-scout reloaded while it ran', steps: 0 })
   }
+  // a handoff awaited by the module before this one never reports back: let the person press Apply again
+  const stuck = (await read($, findingsAtom)).filter(f => f.status === 'handing')
+  for (const f of stuck) {
+    await log($, `#${f.id}: stress-scout reloaded mid-handoff; Apply is offered again (check the prompt did not already go in)`)
+    await setStatus($, f.id, 'new')
+  }
   live.watchTimer?.cancel()
   live.watchTimer = $.clock.every(60_000, () => void heartbeat($))
   await setPhase($, 'idle')

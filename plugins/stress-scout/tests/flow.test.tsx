@@ -593,6 +593,20 @@ test('pressing Apply again while Claude is busy does not queue the prompt twice'
   expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
 })
 
+test('a finding left mid-handoff by a reload can be applied again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { clock, w } = await verifiedFix($, on)
+  w.submitGate = new Promise<void>(() => {})
+  expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+  await clock.settle()
+  expect((await $.command.run(stress('status') as never)).text).toContain('[handing]')
+
+  // a reload runs session.start again; the old module's await never comes back
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  expect((await $.command.run(stress('status') as never)).text).not.toContain('[handing]')
+  expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+})
+
 test('a handoff that fails leaves the finding ready to apply again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
   const { clock, w } = await verifiedFix($, on)
   w.submitFailures.push('throw', 'drop')
