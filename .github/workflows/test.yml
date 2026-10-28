@@ -19,9 +19,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - uses: oven-sh/setup-bun@v2
-      - name: Install Claude Code
-        run: npm install --global @anthropic-ai/claude-code@2.1.312
+      - name: Install Claude Code and Bun
+        run: npm install --global @anthropic-ai/claude-code@2.1.312 bun@1
       - name: Validate the plugin
         run: claude plugin validate --strict plugins/stress-scout
       - name: Plugin tests
