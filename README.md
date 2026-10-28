@@ -16,13 +16,15 @@ A Claude Code mod that stress-tests your code while you build it, and hands back
 At the prompt of a Claude Code terminal session:
 
 ```
-/plugin install stress-scout --marketplace arianpakray/arianpakray
+/plugin marketplace add arianpakray/arianpakray
+/plugin install stress-scout@arianpakray
 ```
 
 From a shell:
 
 ```
-claude plugin install stress-scout --marketplace arianpakray/arianpakray
+claude plugin marketplace add arianpakray/arianpakray
+claude plugin install stress-scout@arianpakray
 ```
 
 This repository is private, so the machine needs GitHub access to it (for example `gh auth login`, then `gh auth setup-git`). On Windows, the simplest way is to run this once in PowerShell. Git Credential Manager opens a browser to sign you in and remembers it:
