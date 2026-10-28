@@ -138,6 +138,8 @@ type World = {
   surfaces: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** The testers' final reports, in the order they run; REPORT once these run out. */
   reports: string[]
+  /** The exit code of the stored harness command when the plugin reruns it. */
+  harnessExit: number
 }
 
 const ok = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
@@ -163,6 +165,7 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     opened: [],
     surfaces: ['desktop'],
     reports: [],
+    harnessExit: 0,
   }
   mock.store(on, stored)
   mock.env(on, place.env)
@@ -185,6 +188,9 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     w.runs.push(e.argv)
     const argv = e.argv.join(' ')
     const index = e.init?.env?.GIT_INDEX_FILE ?? ''
+    if (e.argv[0] === 'sh' && e.argv[1] === '-c') {
+      return { value: { exitCode: w.harnessExit, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (e.argv.some(arg => w.missingTrees.has(arg.replace('^{tree}', '')))) {
       return { value: { exitCode: 128, stdout: '', stderr: 'fatal: bad object', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -547,6 +553,87 @@ test('by default, a verified fix goes to Claude once the session sits idle', { t
   await clock.advance(5 * 60_000)
   await clock.settle()
   expect(w.submitted).toHaveLength(1)
+})
+
+/** The engine's types, where a plugin project keeps them. */
+const TYPES = '.claude-plugin/types/claude-code/index.d.ts'
+const RULE = "No test inputs the engine's types rule out: if a field is typed `string`, don't feed it a number, null or a missing value."
+
+test('the tester is told to feed only inputs the types allow, and a plugin project points it at the engine types', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  on('fs.read', () => ({ value: 'declare module "claude-code" {}' }))
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await $.command.run(stress('the retry loop in api/client.ts') as never)
+  await clock.settle()
+  const plain = w.spawned[0]?.input ?? ''
+  expect(plain).toContain(RULE)
+  expect(plain).toContain("Only feed inputs the code's own declared types and contracts allow.")
+  expect(plain).not.toContain('PLUGIN:')
+
+  // a Claude Code plugin: the manifest, a hooks module and the engine's types
+  for (const path of [`${ROOT}/.claude-plugin/plugin.json`, `${ROOT}/hooks`, `${ROOT}/${TYPES}`]) w.existing.add(path)
+  await $.command.run(stress('the prompt handler in hooks/register.tsx') as never)
+  await clock.settle()
+  const plugin = w.spawned[1]?.input ?? ''
+  expect(plugin).toContain(RULE)
+  expect(plugin).toMatch(/PLUGIN: .*\/snapshot\/\.claude-plugin\/types\/claude-code\/index\.d\.ts/)
+  expect([...w.writes.keys()].some(path => path.endsWith(`/snapshot/${TYPES}`))).toBe(true)
+})
+
+test('a guard-targeted run must prove each bypass under real bash; other runs are not told to', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await $.command.run(stress('checkBash in hooks/lib/policy.ts') as never)
+  await clock.settle()
+  const guard = w.spawned[0]?.input ?? ''
+  expect(guard).toContain('GUARD METHOD')
+  expect(guard).toContain("bash -c 'git(){ echo RAN; }; <case>'")
+
+  await $.command.run(stress('the retry loop in api/client.ts') as never)
+  await clock.settle()
+  expect(w.spawned[1]?.input).not.toContain('GUARD METHOD')
+})
+
+describe('a landed fix is checked by rerunning the stored harness, with no new paid run', () => {
+  for (const [exit, status] of [[0, 'fixed'], [1, 'regressed']] as const) {
+    test(`exit ${exit}: the applied finding becomes ${status}`, { timeoutMs: 30_000 }, async ($, on) => {
+      const clock = mock.clock(on, { now: 1_700_000_000_000 })
+      const w = world(on)
+      on('fs.read', () => ({ value: "the developer's fixed source" }))
+      await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+      await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+      w.tree = TREE_B
+      await clock.advance(45_000)
+      await clock.settle()
+      await $.command.run(stress('apply 1') as never)
+      await clock.settle()
+      expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
+
+      // the developer's session edits the file the finding targets
+      const triaged = w.triagePrompts.length
+      const spawned = w.spawned.length
+      w.harnessExit = exit
+      w.runs.length = 0
+      await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'new', new_string: 'newer' })
+      await clock.settle()
+
+      const harness = w.runs.filter(argv => argv[0] === 'sh' && argv[1] === '-c')
+      expect(harness).toEqual([['sh', '-c', 'timeout 120 node .stress-scout/race.mjs']])
+      const copied = [...w.writes.entries()].find(([path]) => path.endsWith('/snapshot/src/cache.ts'))
+      expect(copied?.[1]).toBe("the developer's fixed source")
+      // no model call, no tester
+      expect(w.triagePrompts).toHaveLength(triaged)
+      expect(w.spawned).toHaveLength(spawned)
+      expect((await $.command.run(stress('status') as never)).text).toContain(`[${status}]`)
+
+      // the pane shows it like any other status
+      const pane = await $.ui.mount({ plugin: 'stress-scout', surface: 'desktop', component: 'Pane', requestId: 'stress-scout', props: PANE })
+      expect(await pane.find({ text: new RegExp(`src/cache\\.ts:LruCache\\.set · concurrency · ${status}`) })).toBeDefined()
+      await pane.unmount()
+    })
+  }
 })
 
 describe('the tester bills what the session bills', () => {
