@@ -68,6 +68,8 @@ const seenAtom = atom({ plugin: 'stress-scout', key: 'seenId' } as const, 0)
 const openAtom = atom({ plugin: 'stress-scout', key: 'openId' } as const, 0)
 const suggestedAtom = atom({ plugin: 'stress-scout', key: 'suggestedId' } as const, 0)
 const waitingAtom = atom({ plugin: 'stress-scout', key: 'waiting' } as const, '')
+/** Set while the rate-limit threshold holds automatic runs: the window and its use, for the status line. */
+const rateHoldAtom = atom({ plugin: 'stress-scout', key: 'rateHold' } as const, '')
 
 type Config = {
   triageModel: string
@@ -169,6 +171,12 @@ const tokensOf = (usage: ModelUsage | undefined): number =>
 
 const dollars = (n: number): string => `$${n < 10 ? n.toFixed(2) : n.toFixed(0)}`
 
+/** The file part of a finding's target (`src/cache.ts:LruCache.set`); a focus phrase stays whole. */
+const fileOf = (target: string): string => target.split(':')[0]?.trim() || target
+
+/** Where "dismiss all <kind> in <file>" is remembered: by file and kind, not by the run's memoryKey. */
+const fileDismissalKey = (file: string, kind: string): string => `file:${file}|${kind}`
+
 const isMemory = (value: unknown): value is Memory =>
   value !== null && typeof value === 'object' && (value as { v?: unknown }).v === 1
 
@@ -204,7 +212,12 @@ async function log($: $, text: string): Promise<void> {
 }
 
 async function refreshStatus($: $): Promise<void> {
-  const [phase, paused, runsUsed] = await Promise.all([read($, phaseAtom), read($, pausedAtom), read($, runsUsedAtom)])
+  const [phase, paused, runsUsed, rateHold] = await Promise.all([
+    read($, phaseAtom),
+    read($, pausedAtom),
+    read($, runsUsedAtom),
+    read($, rateHoldAtom),
+  ])
   const { maxRuns } = live.config
   const text =
     phase.kind === 'off'
@@ -213,7 +226,9 @@ async function refreshStatus($: $): Promise<void> {
         ? `stress-scout ▶ testing ${clip(phase.detail, 60)}`
         : paused
           ? 'stress-scout paused (/stress resume)'
-          : phase.kind === 'triage'
+          : rateHold !== ''
+            ? `stress-scout paused: ${rateHold}`
+            : phase.kind === 'triage'
             ? 'stress-scout … triaging'
             : runsUsed >= maxRuns
               ? `stress-scout ✓ watching · run cap ${runsUsed}/${maxRuns} reached (/stress still works)`
@@ -325,12 +340,24 @@ const WINDOW_NAMES: Readonly<Record<string, string>> = {
   spend_limit: 'spend limit',
 }
 
-/** The usage window at or past the pause point, by name: the 5-hour, the weekly, or a gateway's spend limit. */
-async function fullWindow($: $): Promise<string | undefined> {
+/** The same windows for the status line. */
+const WINDOW_BRIEFS: Readonly<Record<string, string>> = {
+  five_hour: '5h usage',
+  seven_day: 'weekly usage',
+  spend_limit: 'spend limit',
+}
+
+/** The usage window at or past the pause point, by name and as the status line shows it: the 5-hour, the weekly, or a gateway's spend limit. */
+async function fullWindow($: $): Promise<{ name: string; brief: string } | undefined> {
   try {
     const { rateLimits } = await $.session.usage()
     const full = rateLimits.find(limit => limit.percentUsed >= live.config.rateLimitPct)
-    return full === undefined ? undefined : (WINDOW_NAMES[full.kind] ?? full.kind.replace(/_/g, ' '))
+    if (full === undefined) return undefined
+    const spelled = full.kind.replace(/_/g, ' ')
+    return {
+      name: WINDOW_NAMES[full.kind] ?? spelled,
+      brief: `${WINDOW_BRIEFS[full.kind] ?? spelled} ${Math.round(full.percentUsed)}%`,
+    }
   } catch {
     return undefined
   }
@@ -714,8 +741,10 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     if ((await read($, runsUsedAtom)) >= config.maxRuns) return
     const full = await fullWindow($)
     if (full !== undefined) {
-      await log($, `${trigger}: skipped, your ${full} is at or above ${config.rateLimitPct}%`)
-      await update($, waitingAtom, () => `your ${full} is at or above ${config.rateLimitPct}%; automatic runs resume below it`)
+      await log($, `${trigger}: skipped, your ${full.name} is at or above ${config.rateLimitPct}%`)
+      await update($, waitingAtom, () => `your ${full.name} is at or above ${config.rateLimitPct}%; automatic runs resume below it`)
+      await update($, rateHoldAtom, () => full.brief)
+      await refreshStatus($)
       return
     }
     const now = await $.clock.now()
@@ -729,6 +758,7 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     }
   }
   await update($, waitingAtom, () => '')
+  await update($, rateHoldAtom, () => '')
   const c = await ensureCtx($)
   if (c === undefined) {
     await setPhase($, 'off', live.ctxError)
@@ -774,7 +804,11 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   if (!isManual) {
     const tested = memory.tested[memoryKey]
     const dismissed = memory.dismissed[`${memoryKey}|${plan.kind}`]
-    if (tested?.hash === hash || dismissed?.hash === hash) {
+    const file = fileOf(plan.target)
+    // "dismiss all" covers the file itself: any finding of that kind there, until the file's content changes
+    const fileDismissed = memory.dismissed[fileDismissalKey(file, plan.kind)]
+    const isFileDismissed = fileDismissed !== undefined && fileDismissed.hash === blobs.get(file)
+    if (tested?.hash === hash || dismissed?.hash === hash || isFileDismissed) {
       await saveMemory($, c, memory)
       const why = tested?.hash === hash ? `tested (${tested.verdict})` : 'dismissed'
       await log($, `${kind}: ${memoryKey} was already ${why} at this version`)
@@ -1022,6 +1056,14 @@ async function apply($: $, id: number): Promise<string> {
   return `Handing finding #${id} to Claude.`
 }
 
+/** `/stress apply` with no number: the newest finding that has a patch or a next step to hand over. */
+async function applyNewest($: $): Promise<string> {
+  const newest = (await read($, findingsAtom))
+    .filter(f => f.status === 'new' && canHandOver(f))
+    .reduce<Finding | undefined>((best, f) => (best === undefined || f.id > best.id ? f : best), undefined)
+  return newest === undefined ? 'No finding is waiting to be applied.' : apply($, newest.id)
+}
+
 /** Submits the handoff as the person's prompt; the finding counts as applied once it entered. */
 async function handOff($: $, finding: Finding): Promise<void> {
   try {
@@ -1050,6 +1092,27 @@ async function dismiss($: $, id: number): Promise<string> {
     await saveMemory($, c, memory)
   }
   return `Dismissed #${id}; it won't be raised again unless that code changes.`
+}
+
+/** Dismisses the finding and every other open one of its kind in its file, and drops that kind for the file until its content changes. */
+async function dismissAll($: $, id: number): Promise<string> {
+  const finding = (await read($, findingsAtom)).find(f => f.id === id)
+  if (finding === undefined) return `No finding #${id}.`
+  const file = fileOf(finding.target)
+  const isSame = (f: Finding): boolean => fileOf(f.target) === file && f.kind === finding.kind
+  await update($, findingsAtom, list =>
+    list.map(f => (isSame(f) && f.status === 'new' ? { ...f, status: 'dismissed' as const } : f)),
+  )
+  await update($, seenAtom, seen => Math.max(seen, id))
+  const c = await ensureCtx($)
+  if (c !== undefined) {
+    const tree = await currentTree($, c).catch(() => '')
+    const blobs = tree !== '' ? await blobsOf($, c.shadow, tree, [file]) : new Map<string, string>()
+    const memory = await loadMemory($, c)
+    memory.dismissed[fileDismissalKey(file, finding.kind)] = { at: await $.clock.now(), hash: blobs.get(file) ?? '' }
+    await saveMemory($, c, memory)
+  }
+  return `Dismissed every ${finding.kind} finding in ${file}; they won't be raised again unless that file changes.`
 }
 
 async function togglePause($: $, isPaused: boolean): Promise<string> {
@@ -1146,8 +1209,9 @@ const HELP = [
   '/stress <focus>    stress-test something specific, e.g. /stress the retry logic in api/client.ts',
   '/stress show       open the Stress Scout pane',
   '/stress status     what it is doing and what it found',
-  '/stress apply N    hand finding N to Claude (patch and evidence attached)',
+  '/stress apply [N]  hand finding N to Claude (patch and evidence attached); no N: the newest one with a fix',
   '/stress dismiss N  drop finding N; it is not raised again unless the code changes',
+  '/stress dismiss N all  drop every finding of that kind in finding N\'s file, until the file changes',
   '/stress stop       stop the running test',
   '/stress pause | resume | forget',
 ].join('\n')
@@ -1173,9 +1237,11 @@ async function runCommand($: $, args: string): Promise<string> {
     case 'stop':
       return stopTester($)
     case 'apply':
-      return Number.isInteger(n) && n > 0 ? apply($, n) : 'Usage: /stress apply <finding number>'
+      if (rest[0] === undefined || rest[0] === '') return applyNewest($)
+      return Number.isInteger(n) && n > 0 ? apply($, n) : 'Usage: /stress apply [finding number]'
     case 'dismiss':
-      return Number.isInteger(n) && n > 0 ? dismiss($, n) : 'Usage: /stress dismiss <finding number>'
+      if (!Number.isInteger(n) || n <= 0) return 'Usage: /stress dismiss <finding number> [all]'
+      return (rest[1] ?? '').toLowerCase() === 'all' ? dismissAll($, n) : dismiss($, n)
     case 'forget':
       return forget($)
     case 'help':
@@ -1194,7 +1260,7 @@ async function onSessionStart($: $): Promise<void> {
   await $.command.register({
     name: 'stress',
     description: 'stress-scout: stress-test the latest changes now (or a focus you name); show, status, stop, pause, resume',
-    argumentHint: '[focus | show | status | stop | pause | resume | apply N | dismiss N | forget]',
+    argumentHint: '[focus | show | status | stop | pause | resume | apply [N] | dismiss N [all] | forget]',
   })
   const stale = await read($, runAtom)
   if (stale !== null) {
@@ -1297,9 +1363,15 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (live.role === 'tester' || e.props.hasSurvey) return next(e)
-    const [findings, seenId] = await Promise.all([read($, findingsAtom), read($, seenAtom)])
+    const [findings, seenId, runsUsed] = await Promise.all([read($, findingsAtom), read($, seenAtom), read($, runsUsedAtom)])
     const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.id > seenId)
     if (finding === undefined) return next(e)
+    const { maxDollarsPerRun, maxRuns } = live.config
+    const tidy = (n: number): string => dollars(n).replace(/\.00$/, '')
+    const budget =
+      finding.cost > 0
+        ? `${dollars(finding.cost)} · ${tidy(Math.max(0, maxDollarsPerRun - finding.cost))} left of ${tidy(maxDollarsPerRun)} per run · ${runsUsed}/${maxRuns} runs`
+        : ''
     const { Box, Text, Button } = $.ui.resolve(e)
     const isGraphical = e.surface !== 'terminal'
     const delta = finding.before !== '' && finding.after !== '' ? ` (${finding.before} → ${finding.after})` : ''
@@ -1318,6 +1390,11 @@ export const register: Register = (on, options) => {
         {finding.fixSummary !== '' && (
           <Text dimColor wrap="truncate-end" size="footnote">
             {`${finding.isVerified ? 'verified fix' : 'unverified fix'}: ${finding.fixSummary}${delta}`}
+          </Text>
+        )}
+        {budget !== '' && (
+          <Text key="budget" dimColor wrap="truncate-end" size="footnote" tabular>
+            {budget}
           </Text>
         )}
         <Box flexDirection="row" gap={isGraphical ? 'xs' : 1}>
@@ -1349,6 +1426,9 @@ export const register: Register = (on, options) => {
       read($, waitingAtom),
     ])
     const next = phase.kind === 'idle' && !paused ? nextText(waiting, runsUsed) : ''
+    // findings grouped under their file; groups run newest first by their newest finding, as the list does
+    const groups = new Map<string, Finding[]>()
+    for (const f of findings.slice(0, 12)) groups.set(fileOf(f.target), [...(groups.get(fileOf(f.target)) ?? []), f])
     const state =
       phase.kind === 'off'
         ? `off: ${phase.detail}`
@@ -1404,62 +1484,76 @@ export const register: Register = (on, options) => {
             untested code while the session is idle, and puts what it finds here. Run now skips the wait.
           </Text>
         )}
-        {findings.slice(0, 12).map(f => {
-          const isOpen = openId === f.id
-          const isNew = f.status === 'new'
-          const delta = f.before !== '' && f.after !== '' ? ` (${f.before} → ${f.after})` : ''
-          const cost = f.cost > 0 ? ` · ${dollars(f.cost)}` : ''
-          const card = isGraphical
-            ? {
-                borderStyle: 'round',
-                borderColor: isNew ? verdictColor(f.verdict) : 'subtle',
-                borderDimColor: !isNew,
-                padding: 'sm' as const,
-                gap: 'xs' as const,
-              }
-            : {}
-          return (
-            <Box key={`finding-${f.id}`} flexDirection="column" {...card}>
-              <Box flexDirection="row" gap={row}>
-                <Text color={verdictColor(f.verdict)} bold weight="semibold">{`#${f.id} ${f.verdict}`}</Text>
-                <Text wrap="truncate-end" dimColor={!isNew} mono={isGraphical}>
-                  {`${f.target} · ${f.kind}${!isNew ? ` · ${f.status}` : ''}`}
-                </Text>
-              </Box>
-              <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={isGraphical && !isNew}>
-                {f.headline}
-              </Text>
-              {f.fixSummary !== '' && (
-                <Text dimColor size="footnote" wrap={isOpen ? 'wrap' : 'truncate-end'}>
-                  {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}
-                </Text>
-              )}
-              {isOpen && (
-                <Box flexDirection="column" gap={row}>
-                  {f.evidence !== '' && detail('evidence', 'Evidence', f.evidence)}
-                  {f.before !== '' && detail('before', 'Before', f.before)}
-                  {f.after !== '' && detail('after', 'After', f.after)}
-                  {f.fixExplanation !== '' && detail('why', 'Why it works', f.fixExplanation)}
-                  {f.nextStep !== '' && detail('next', 'Next step', f.nextStep)}
-                  <Text dimColor size="footnote" mono={isGraphical}>
-                    {`Harness: ${f.snapshot}/.stress-scout/${f.rerun !== '' ? `  ·  rerun: ${f.rerun}` : ''}`}
+        {[...groups].map(([file, items]) => (
+          <Box key={`file-${file}`} flexDirection="column" gap={row}>
+            <Text key="file" bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical} mono={isGraphical} wrap="truncate-end">
+              {file}
+            </Text>
+            {items.map(f => {
+              const isOpen = openId === f.id
+              const isNew = f.status === 'new'
+              const delta = f.before !== '' && f.after !== '' ? ` (${f.before} → ${f.after})` : ''
+              const cost = f.cost > 0 ? ` · ${dollars(f.cost)}` : ''
+              const card = isGraphical
+                ? {
+                    borderStyle: 'round',
+                    borderColor: isNew ? verdictColor(f.verdict) : 'subtle',
+                    borderDimColor: !isNew,
+                    padding: 'sm' as const,
+                    gap: 'xs' as const,
+                  }
+                : {}
+              return (
+                <Box key={`finding-${f.id}`} flexDirection="column" {...card}>
+                  <Box flexDirection="row" gap={row}>
+                    <Text color={verdictColor(f.verdict)} bold weight="semibold">{`#${f.id} ${f.verdict}`}</Text>
+                    <Text wrap="truncate-end" dimColor={!isNew} mono={isGraphical}>
+                      {`${f.target} · ${f.kind}${!isNew ? ` · ${f.status}` : ''}`}
+                    </Text>
+                  </Box>
+                  <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={isGraphical && !isNew}>
+                    {f.headline}
                   </Text>
-                  <Text dimColor size="footnote" tabular>
-                    {`Took ${ago(f.durationMs)} · ${compactTokens(f.tokens)} tokens${cost} · confidence ${f.confidence}`}
-                  </Text>
-                  {f.patch !== '' && <Code source={clip(f.patch, 12_000)} format="diff" language="diff" />}
+                  {f.fixSummary !== '' && (
+                    <Text dimColor size="footnote" wrap={isOpen ? 'wrap' : 'truncate-end'}>
+                      {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}
+                    </Text>
+                  )}
+                  {isOpen && (
+                    <Box flexDirection="column" gap={row}>
+                      {f.evidence !== '' && detail('evidence', 'Evidence', f.evidence)}
+                      {f.before !== '' && detail('before', 'Before', f.before)}
+                      {f.after !== '' && detail('after', 'After', f.after)}
+                      {f.fixExplanation !== '' && detail('why', 'Why it works', f.fixExplanation)}
+                      {f.nextStep !== '' && detail('next', 'Next step', f.nextStep)}
+                      <Text dimColor size="footnote" mono={isGraphical}>
+                        {`Harness: ${f.snapshot}/.stress-scout/${f.rerun !== '' ? `  ·  rerun: ${f.rerun}` : ''}`}
+                      </Text>
+                      <Text dimColor size="footnote" tabular>
+                        {`Took ${ago(f.durationMs)} · ${compactTokens(f.tokens)} tokens${cost} · confidence ${f.confidence}`}
+                      </Text>
+                      {f.patch !== '' && <Code source={clip(f.patch, 12_000)} format="diff" language="diff" />}
+                    </Box>
+                  )}
+                  <Box flexDirection="row" gap={row}>
+                    {isNew && canHandOver(f) && (
+                      <Button key={`apply-${f.id}`} label={handOverLabel(f)} variant="primary" onPress={() => void apply($, f.id)} />
+                    )}
+                    <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
+                    {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}
+                    {isNew && isOpen && (
+                      <Button
+                        key={`dismiss-all-${f.id}`}
+                        label={`Dismiss all ${f.kind} in ${clip(file, 40)}`}
+                        onPress={() => void dismissAll($, f.id)}
+                      />
+                    )}
+                  </Box>
                 </Box>
-              )}
-              <Box flexDirection="row" gap={row}>
-                {isNew && canHandOver(f) && (
-                  <Button key={`apply-${f.id}`} label={handOverLabel(f)} variant="primary" onPress={() => void apply($, f.id)} />
-                )}
-                <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
-                {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}
-              </Box>
-            </Box>
-          )
-        })}
+              )
+            })}
+          </Box>
+        ))}
         {activity.length > 0 && (
           <Box flexDirection="column" gap={isGraphical ? 'xs' : 0}>
             <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>
