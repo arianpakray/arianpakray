@@ -567,3 +567,16 @@ test('inside a Windows tester process the guard reads Windows and Git Bash paths
   expect(JSON.stringify(runIt)).not.toContain('stress-scout guard')
   expect(ran).toBe(3)
 })
+
+test('a bare /stress and a prompt with empty text pass through', { timeoutMs: 30_000 }, async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
+  // the engine sends args as "" when nothing follows the name, and an image-only prompt as text ""
+  const bare = await $.command.run(stress('') as never)
+  expect(bare.text).toContain('Stress-testing the latest change')
+  const count = w.submitted.length
+  await $.prompt.submit({ text: '', wait: false, origin: { kind: 'composer' } })
+  expect(w.submitted).toHaveLength(count + 1)
+  expect(w.submitted.at(-1)?.context ?? []).toHaveLength(0)
+})
