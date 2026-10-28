@@ -611,7 +611,7 @@ test('inside the tester process the mod is the guard alone', { timeoutMs: 30_000
   const intoProject = await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/a.ts`, content: 'x' })
   expect(JSON.stringify(intoProject)).toContain('stress-scout guard')
   const push = await toolCall($, { tool: 'Bash', command: 'git push origin main' })
-  expect(JSON.stringify(push)).toContain('git push is not allowed')
+  expect(JSON.stringify(push)).toContain('not on the tester allowlist')
   const secrets = await toolCall($, { tool: 'Read', file_path: '/Users/dev/.ssh/id_ed25519' })
   expect(JSON.stringify(secrets)).toContain('secrets')
   expect(ran).toBe(0)

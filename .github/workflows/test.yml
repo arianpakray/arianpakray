@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -27,3 +27,7 @@ jobs:
         run: claude plugin test plugins/stress-scout
       - name: Real file system and git
         run: bun ci/real-fs.ts
+      - name: Guard against real bash
+        # every case bash really runs must be refused by the guard; needs bash, so not on Windows
+        if: runner.os != 'Windows'
+        run: bun ci/guard-harness.ts
