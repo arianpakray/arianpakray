@@ -26,6 +26,8 @@ export type Report = {
   kind: string
   verdict: Verdict
   headline: string
+  plain: string
+  plainFix: string
   evidence: string
   before: string
   after: string
@@ -79,6 +81,8 @@ export function parseReport(answer: string): Report | undefined {
     kind: kindOf(raw.kind),
     verdict: VERDICTS.includes(verdict) ? verdict : 'inconclusive',
     headline: str(raw.headline, 140),
+    plain: str(raw.plain, 260),
+    plainFix: str(raw.plainFix, 160),
     evidence: str(raw.evidence, 900),
     before: str(raw.before, 160),
     after: str(raw.after, 160),

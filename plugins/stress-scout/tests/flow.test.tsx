@@ -454,6 +454,53 @@ test('openPaneOnStart off leaves the pane to /stress show', { timeoutMs: 30_000,
   expect(w.opened).toEqual(['stress-scout'])
 })
 
+const PLAIN = "Your cache can lose saved items when many things write to it at once."
+const PLAIN_FIX = 'Make the cache finish one write before it starts the next.'
+const plainReport = (extra: Record<string, unknown>): string =>
+  REPORT.replace(/\n```$/, '').replace('```json\n', '```json\n').replace(/\{.*\}/s, json => JSON.stringify({ ...JSON.parse(json), ...extra })) + '\n```'
+
+for (const [name, surface] of [['terminal', 'terminal'], ['desktop', 'desktop']] as const) {
+  test(`on ${name}, the band and the pane lead with the plain explanation, and fall back to the headline without one`, { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.reports.push(plainReport({ plain: PLAIN, plainFix: PLAIN_FIX }))
+    await $.session.start({ cwd: ROOT, surface, isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+
+    const band = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'AbovePrompt', props: BAND })
+    expect(await band.find({ text: PLAIN })).toBeDefined()
+    expect(await band.find({ text: `Fix (tested): ${PLAIN_FIX}` })).toBeDefined()
+    expect(await band.find({ text: /lost 1,214 of 10,000/ })).toBeUndefined()
+    await band.unmount()
+
+    const pane = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'Pane', requestId: 'stress-scout', props: PANE })
+    expect(await pane.find({ text: PLAIN })).toBeDefined()
+    expect(await pane.find({ text: /lost 1,214 of 10,000/ })).toBeDefined()
+    await pane.unmount()
+  })
+
+  test(`on ${name}, a finding without plain text shows the technical headline`, { timeoutMs: 30_000 }, async ($, on) => {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    await $.session.start({ cwd: ROOT, surface, isInteractive: true })
+    await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+    w.tree = TREE_B
+    await clock.advance(45_000)
+    await clock.settle()
+
+    const band = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'AbovePrompt', props: BAND })
+    expect(await band.find({ text: /src\/cache.ts:LruCache.set: lost 1,214 of 10,000/ })).toBeDefined()
+    expect(await band.find({ text: /verified fix: evict before the await/ })).toBeDefined()
+    await band.unmount()
+    const pane = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'Pane', requestId: 'stress-scout', props: PANE })
+    expect(await pane.find({ text: /lost 1,214 of 10,000/ })).toBeDefined()
+    await pane.unmount()
+  })
+}
+
 test('a newer unverified finding does not hold back an older verified fix', { timeoutMs: 30_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
   const w = world(on)
