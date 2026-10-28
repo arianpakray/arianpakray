@@ -1,0 +1,95 @@
+{
+  "name": "stress-scout",
+  "version": "0.1.0",
+  "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
+  "author": { "name": "arianpakray" },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "triageModel": {
+      "type": "string",
+      "title": "Triage model",
+      "description": "Cheap model that decides whether a change is worth a stress test.",
+      "default": "haiku",
+      "options": ["haiku", "sonnet"]
+    },
+    "testerModel": {
+      "type": "string",
+      "title": "Tester model",
+      "description": "Model the background tester runs on (writes, runs and fixes the stress test).",
+      "default": "sonnet",
+      "options": ["sonnet", "opus", "haiku", "inherit"]
+    },
+    "maxRunsPerSession": {
+      "type": "number",
+      "title": "Max automatic test runs per session",
+      "description": "Hard cap on automatic deep runs; /stress still runs on demand.",
+      "default": 8
+    },
+    "maxSweepsPerSession": {
+      "type": "number",
+      "title": "Max idle sweeps per session",
+      "description": "How many of the automatic runs may go to idle sweeps of untested code.",
+      "default": 3
+    },
+    "minMinutesBetweenRuns": {
+      "type": "number",
+      "title": "Minutes between automatic runs",
+      "description": "Minimum gap between two automatic deep runs.",
+      "default": 3
+    },
+    "quietSeconds": {
+      "type": "number",
+      "title": "Quiet seconds before a change scan",
+      "description": "How long edits must settle before the change is triaged.",
+      "default": 45
+    },
+    "maxWaitSeconds": {
+      "type": "number",
+      "title": "Max seconds between scans while editing",
+      "description": "During non-stop editing, scan at least this often.",
+      "default": 240
+    },
+    "idleSeconds": {
+      "type": "number",
+      "title": "Idle seconds after a turn",
+      "description": "How long after Claude finishes a turn before an idle scan.",
+      "default": 30
+    },
+    "sweepWhenIdle": {
+      "type": "boolean",
+      "title": "Sweep untested code when idle",
+      "description": "When nothing changed, test the riskiest area not tested yet.",
+      "default": true
+    },
+    "sweepMinutes": {
+      "type": "number",
+      "title": "Minutes between idle sweeps",
+      "description": "Minimum gap between two idle sweeps.",
+      "default": 20
+    },
+    "maxDollarsPerRun": {
+      "type": "number",
+      "title": "Max dollars per test run",
+      "description": "The tester stops when one run reaches this cost (claude --max-budget-usd).",
+      "default": 2
+    },
+    "claudePath": {
+      "type": "string",
+      "title": "Path to the claude binary",
+      "description": "Leave empty to use the running Claude Code's own binary.",
+      "default": ""
+    },
+    "pauseAtRateLimitPercent": {
+      "type": "number",
+      "title": "Pause at rate-limit %",
+      "description": "Skip automatic runs while your 5-hour usage window is at or above this percent.",
+      "default": 80
+    },
+    "testerTimeoutMinutes": {
+      "type": "number",
+      "title": "Tester timeout (minutes)",
+      "description": "Give up on a tester run after this long.",
+      "default": 20
+    }
+  }
+}
