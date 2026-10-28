@@ -9,6 +9,8 @@ const REPORT = {
   kind: 'concurrency',
   verdict: 'broke',
   headline: 'lost 1,214 of 10,000 writes under 64 concurrent writers',
+  plain: 'Your cache can silently lose saved items when many things write to it at once.',
+  plainFix: 'Make the cache finish one write before it starts the next.',
   evidence: 'set() reads size, awaits persist(), then evicts: interleaved writers evict live keys',
   before: '1,214/10,000 writes lost',
   after: '0/10,000 writes lost',
@@ -31,6 +33,17 @@ test('a bare report is found, and its nested fix is never taken for it', () => {
   const report = parseReport(`I ran it: ${JSON.stringify(REPORT)} and that is all.`)
   expect(report?.target).toBe('src/cache.ts:LruCache.set')
   expect(report?.fix?.summary).toBe('evict before the await, under one critical section')
+})
+
+test('the plain-language fields are read, and a report without them gets empty ones', () => {
+  const report = parseReport(`\`\`\`json\n${JSON.stringify(REPORT)}\n\`\`\``)
+  expect(report?.plain).toBe('Your cache can silently lose saved items when many things write to it at once.')
+  expect(report?.plainFix).toBe('Make the cache finish one write before it starts the next.')
+  const { plain: _plain, plainFix: _plainFix, ...older } = REPORT
+  const bare = parseReport(`\`\`\`json\n${JSON.stringify(older)}\n\`\`\``)
+  expect(bare?.verdict).toBe('broke')
+  expect(bare?.plain).toBe('')
+  expect(bare?.plainFix).toBe('')
 })
 
 test('odd values are normalized and a missing report is undefined', () => {
