@@ -311,12 +311,34 @@ async function recentIntent($: $): Promise<string[]> {
     .map(m => clip(oneLine(m.text), 400))
 }
 
-async function isRateLimited($: $): Promise<boolean> {
+const WINDOW_NAMES: Readonly<Record<string, string>> = {
+  five_hour: '5-hour usage window',
+  seven_day: 'weekly usage window',
+  spend_limit: 'spend limit',
+}
+
+/** The usage window at or past the pause point, by name: the 5-hour, the weekly, or a gateway's spend limit. */
+async function fullWindow($: $): Promise<string | undefined> {
   try {
     const { rateLimits } = await $.session.usage()
-    return rateLimits.some(limit => limit.kind === 'five_hour' && limit.percentUsed >= live.config.rateLimitPct)
+    const full = rateLimits.find(limit => limit.percentUsed >= live.config.rateLimitPct)
+    return full === undefined ? undefined : (WINDOW_NAMES[full.kind] ?? full.kind.replace(/_/g, ' '))
   } catch {
-    return false
+    return undefined
+  }
+}
+
+/**
+ * Whether the session bills a Claude plan: its credential is a claude.ai
+ * login's token, not an API key. Where the engine won't say, a plan's own
+ * 5-hour or weekly window tells, once a reply has reported one.
+ */
+async function isOnPlan($: $): Promise<boolean> {
+  try {
+    return (await $.session.authorize())?.kind === 'bearer'
+  } catch {
+    const { rateLimits } = await $.session.usage().catch(() => ({ rateLimits: [] }))
+    return rateLimits.some(limit => limit.kind === 'five_hour' || limit.kind === 'seven_day')
   }
 }
 
@@ -526,6 +548,7 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
   const { config } = live
   const exec = config.claudePath !== '' ? config.claudePath : ((await $.env.get('CLAUDE_CODE_EXECPATH')) ?? '') || 'claude'
   const box = sandboxOf(c, run)
+  const isPlan = await isOnPlan($)
   const env = {
     STRESS_SCOUT_ROLE: 'tester',
     STRESS_SCOUT_ROOTS: JSON.stringify(box.roots),
@@ -533,6 +556,9 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
     STRESS_SCOUT_HOME: box.home,
     // Windows programs read TEMP and TMP; Git Bash and the rest read TMPDIR
     ...tempEnv(c.isWindows ? portable(`${run.runDir}/tmp`) : `${run.runDir}/tmp`, c.isWindows),
+    // claude -p bills an ANTHROPIC_API_KEY it finds in the environment without asking, where a session
+    // asks first: on a plan login an empty one keeps the tester billing the plan, as the session does
+    ...(isPlan ? { ANTHROPIC_API_KEY: '' } : {}),
   }
   let result: TesterResult | undefined
   let steps = 0
@@ -678,8 +704,9 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   if (!isManual) {
     if (await read($, pausedAtom)) return
     if ((await read($, runsUsedAtom)) >= config.maxRuns) return
-    if (await isRateLimited($)) {
-      await log($, `${trigger}: skipped, your 5-hour usage window is above ${config.rateLimitPct}%`)
+    const full = await fullWindow($)
+    if (full !== undefined) {
+      await log($, `${trigger}: skipped, your ${full} is at or above ${config.rateLimitPct}%`)
       return
     }
     const now = await $.clock.now()
