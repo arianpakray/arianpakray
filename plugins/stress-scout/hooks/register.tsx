@@ -60,6 +60,10 @@ const RERUN_TIMEOUT_MS = 120_000
 /** The statuses a finding's harness is rerun in: its fix may have landed, or may since have broken. */
 const RERUN_STATUSES = new Set<Finding['status']>(['applied', 'fixed', 'regressed'])
 const NO_CHANGE = 'no change since the last scan'
+/** Bump when TRIAGE_SYSTEM or the prompt shape changes, so verdicts cached under the old wording are not reused. */
+const TRIAGE_VERSION = 1
+const TRIAGE_CACHE_KEEP = 200
+const TRIAGE_CACHE_MAX_AGE_MS = 7 * 24 * 3_600_000
 
 const phaseAtom = atom({ plugin: 'stress-scout', key: 'phase' } as const, { kind: 'idle', detail: '', since: 0 })
 const findingsAtom = atom({ plugin: 'stress-scout', key: 'findings' } as const, [])
@@ -321,7 +325,16 @@ async function ensureCtx($: $): Promise<Ctx | undefined> {
 
 async function loadMemory($: $, c: Ctx): Promise<Memory> {
   const raw = await $.store.get(memoryKeyOf(c))
-  return isMemory(raw) ? raw : emptyMemory()
+  return isMemory(raw) ? { ...emptyMemory(), ...raw } : emptyMemory()
+}
+
+const triageCacheKeyOf = (c: Ctx): string => `triage:${c.projectKey}`
+
+type TriageCache = Record<string, { at: number; plan: Triage }>
+
+async function loadTriageCache($: $, c: Ctx): Promise<TriageCache> {
+  const raw = await $.store.get(triageCacheKeyOf(c))
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? (raw as TriageCache) : {}
 }
 
 const newest = <T extends { at: number }>(record: Record<string, T>, n: number): Record<string, T> =>
@@ -472,7 +485,16 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
 
 // ---- the cycle: fingerprint, triage, test (scout role) -------------------------------
 
-async function triage($: $, prompt: string): Promise<{ plan?: Triage; tokens: number; error?: string }> {
+/**
+ * Triage a change, or reuse the verdict for the same code from any session: `basis` is
+ * the code the model is judging (the diff, or the sweep's candidate rows), not the
+ * surrounding prompt, which changes with the conversation.
+ */
+async function triage($: $, c: Ctx, prompt: string, basis: string): Promise<{ plan?: Triage; tokens: number; error?: string }> {
+  const now = await $.clock.now()
+  const key = fnv(`${TRIAGE_VERSION}|${live.config.triageModel}|${basis.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim()}`)
+  const hit = (await loadTriageCache($, c))[key]
+  if (hit !== undefined && now - hit.at < TRIAGE_CACHE_MAX_AGE_MS) return { plan: { ...hit.plan, files: [...hit.plan.files] }, tokens: 0 }
   const reply = await $.model.complete({
     model: live.config.triageModel,
     system: TRIAGE_SYSTEM,
@@ -486,7 +508,12 @@ async function triage($: $, prompt: string): Promise<{ plan?: Triage; tokens: nu
     return { tokens, error: why }
   }
   const plan = parseTriage(reply.text)
-  return plan === undefined ? { tokens, error: 'triage reply was unreadable' } : { plan, tokens }
+  if (plan === undefined) return { tokens, error: 'triage reply was unreadable' }
+  // re-read: another session may have cached a verdict while the model was answering
+  const cache = { ...(await loadTriageCache($, c)), [key]: { at: now, plan } }
+  const fresh = Object.fromEntries(Object.entries(cache).filter(([, entry]) => now - entry.at < TRIAGE_CACHE_MAX_AGE_MS))
+  await $.store.set(triageCacheKeyOf(c), newest(fresh, TRIAGE_CACHE_KEEP))
+  return { plan, tokens }
 }
 
 /** The project's tree as it stands, through a shadow that is rebuilt when damaged. */
@@ -534,7 +561,7 @@ async function choose(
     if (paths.length > 0) {
       const stat = await diffStat($, c.shadow, base, tree)
       const diff = await diffText($, c.shadow, base, tree, [], 24_000)
-      const result = await triage($, changeTriagePrompt({ intent, memory, now, currentHashes, stat, diff }))
+      const result = await triage($, c, changeTriagePrompt({ intent, memory, now, currentHashes, stat, diff }), `${stat}\n${diff}`)
       if (result.plan === undefined) return { kind: 'change', note: result.error ?? 'triage failed' }
       memory.lastTree = tree
       return { chosen: { plan: result.plan, tokens: result.tokens, base }, kind: 'change', note: '' }
@@ -548,7 +575,8 @@ async function choose(
     ((trigger === 'idle' || trigger === 'sweep') &&
       config.isSweeping &&
       sweepsUsed < config.maxSweeps &&
-      now - memory.lastSweepAt >= config.sweepGapMs)
+      now - memory.lastSweepAt >= config.sweepGapMs &&
+      now - memory.lastRunEndedAt >= config.sweepGapMs)
   if (!isSweepDue) return { kind: trigger, note: NO_CHANGE }
 
   memory.lastSweepAt = now
@@ -562,7 +590,12 @@ async function choose(
   const isTestedNow = (path: string, sha: string): boolean => testedFiles.get(path) === fnv(`${path}:${sha}`)
   const candidates = rankCandidates(files, history, isTestedNow)
   if (candidates.length === 0) return { kind: 'sweep', note: 'nothing untested left to sweep' }
-  const result = await triage($, sweepTriagePrompt({ intent, memory, now, currentHashes, candidates }))
+  const result = await triage(
+    $,
+    c,
+    sweepTriagePrompt({ intent, memory, now, currentHashes, candidates }),
+    JSON.stringify(candidates),
+  )
   if (result.plan === undefined) return { kind: 'sweep', note: result.error ?? 'triage failed' }
   return { chosen: { plan: result.plan, tokens: result.tokens, base: '' }, kind: 'sweep', note: '' }
 }
@@ -1022,9 +1055,13 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
   await update($, tokensAtom, n => n + outcome.tokens)
   await update($, dollarsAtom, n => n + outcome.cost)
   await update($, runAtom, () => null)
-  if (c !== undefined && (report !== undefined || outcome.cost > 0)) {
+  if (c !== undefined) {
     const memory = await loadMemory($, c)
-    memory.tested[run.memoryKey] = { at: now, verdict: finding.verdict, kind: finding.kind, hash: run.hash }
+    if (report !== undefined || outcome.cost > 0) {
+      memory.tested[run.memoryKey] = { at: now, verdict: finding.verdict, kind: finding.kind, hash: run.hash }
+    }
+    // any run counts, so an idle sweep does not follow close behind a change test or a manual one
+    memory.lastRunEndedAt = now
     await saveMemory($, c, memory)
   }
   const verified = finding.isVerified ? ' · fix verified' : ''
@@ -1166,7 +1203,9 @@ async function heartbeat($: $): Promise<void> {
     return
   }
   const isIdle = !live.isMainBusy && now - live.lastActivityAt >= config.idleMs
-  if (isIdle && config.isSweeping && now - memory.lastSweepAt >= config.sweepGapMs) void kick($, 'sweep')
+  if (isIdle && config.isSweeping && now - memory.lastSweepAt >= config.sweepGapMs && now - memory.lastRunEndedAt >= config.sweepGapMs) {
+    void kick($, 'sweep')
+  }
 }
 
 // ---- actions behind the buttons and /stress -------------------------------------------

@@ -45,6 +45,8 @@ export type Memory = {
   v: 1
   lastTree: string
   lastSweepAt: number
+  /** when the last test run of any kind finished */
+  lastRunEndedAt: number
   nextId: number
   touchedAt: number
   tested: Record<string, { at: number; verdict: string; kind: string; hash: string }>
@@ -55,6 +57,7 @@ export const emptyMemory = (): Memory => ({
   v: 1,
   lastTree: '',
   lastSweepAt: 0,
+  lastRunEndedAt: 0,
   nextId: 1,
   touchedAt: 0,
   tested: {},
