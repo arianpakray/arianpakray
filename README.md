@@ -4,12 +4,12 @@ A Claude Code mod that stress-tests your code while you build it, and hands back
 
 ## How it works
 
-1. **Watches.** It sees Claude's edits as they happen, checks once a minute for edits you make yourself, and notices when the session goes idle.
+1. **Watches.** It sees Claude's edits as they happen, checks once a minute for edits you make yourself, and notices when the session goes idle. Each edit Claude makes also gets a quick Haiku review in the background; a likely bug reaches Claude as a short note on its next tool result, labelled as an automated second opinion (`reviewEdits`, up to 60 a session).
 2. **Triages cheaply.** Once a change settles (45 s of quiet, or every 4 min during non-stop editing), Haiku reads the diff and your latest prompts, then decides whether anything is worth a stress test: concurrency, parsing, resource lifetimes, unbounded loops, money and time math, auth checks. Most changes aren't, and they cost almost nothing to rule out.
 3. **Tests in a sandbox.** It copies your working tree, uncommitted changes included, into a throwaway snapshot and starts a headless `claude -p` tester there (Sonnet by default). The tester writes a targeted harness (races, load, fuzzing, edge cases, leaks) and escalates it until the code breaks or holds at a credible ceiling, recording the numbers.
 4. **Proves the fix.** If the code breaks, the tester fixes the snapshot's copy and reruns the identical harness. The patch is read back from git, not taken from the model's description of it.
-5. **Hands over.** The Stress Scout pane opens by itself in every session and says what the next automatic run waits on. It and a banner above the prompt show each verdict with before and after numbers. **Apply via Claude** sends the patch and evidence to Claude (**Send to Claude** when there's a next step but no patch), or press Tab to take the suggested prompt. A fix the tester proved goes to Claude by itself once the session has sat idle for 30 s (a new turn cancels it); anything unverified waits for you. Turn off **Hand verified fixes to Claude automatically** in `/config` to approve every fix yourself.
-6. **Remembers.** Per project and across sessions, it records what it tested (by content hash) and what you dismissed, so it doesn't repeat itself. When the session is idle and nothing has changed, it sweeps the riskiest code it hasn't tested yet.
+5. **Hands over.** The Stress Scout pane opens by itself in every session and says what the next automatic run waits on. It and a banner above the prompt show each verdict with before and after numbers. **Apply via Claude** sends the patch and evidence to Claude (**Send to Claude** when there's a next step but no patch), or press Tab to take the suggested prompt. A fix the tester proved reaches Claude by itself: while Claude is working it rides on Claude's next tool result, fenced as untrusted data (`deliverFixesInContext`); otherwise it goes once the session has sat idle for 30 s (a new turn cancels it). Neither happens for a fix that came from an idea or a discovery, whose report reads like an instruction, or whose code changed since the snapshot (that one asks you to re-test first). Anything unverified waits for you. Turn off **Hand verified fixes to Claude automatically** in `/config` to approve every fix yourself.
+6. **Remembers.** Per project and across sessions, it records what it tested (by content hash) and what you dismissed, so it doesn't repeat itself. When the session is idle and nothing has changed, it sweeps the riskiest code it hasn't tested yet, then tries its newest improvement idea in the sandbox (`tryIdeasWhenIdle`), then researches an open question (`discoverWhenIdle`).
 
 ## Install
 
@@ -59,7 +59,7 @@ The pane also holds two lists. **Ideas** are small improvements the triage model
 These are the defaults; change them in `/config` under stress-scout.
 
 - A Haiku triage gates every automatic run, and the tester runs only when the risk is medium or high.
-- At most 8 automatic runs per session (up to 3 of them idle sweeps), at least 3 minutes apart. `/stress` always works.
+- At most 30 automatic runs per session (up to 8 of them idle sweeps), at least 3 minutes apart. `/stress` works until the session cap below.
 - Each run is capped at $2 (`--max-budget-usd`) and 20 minutes. A run that times out is still billed what its stream reported.
 - A session is capped at $15 (`maxDollarsPerSession`; 0 turns it off): no test starts, automatic or on demand, once what the session has spent plus the cap of one more test would pass it. Automatic runs wait with a note in the pane; `/stress` says which setting to raise.
 - Automatic runs pause while your 5-hour or weekly usage window is at or above 80%. That keeps them short of your plan's limits, past which extra usage, if you've turned it on, is billed.

@@ -18,6 +18,7 @@ import {
   HANDOFF,
   HANDOFF_DETAILS,
   IDEA_SYSTEM,
+  REVIEW_SYSTEM,
   TESTER_SYSTEM,
   TRIAGE_SYSTEM,
   changeTriagePrompt,
@@ -26,6 +27,7 @@ import {
   handoffContext,
   handoffMessage,
   handoffPrompt,
+  reviewPrompt,
   PLUGIN_TYPES,
   sweepTriagePrompt,
   testerTask,
@@ -52,6 +54,7 @@ import {
   isActionable,
   parseDiscovery,
   parseReport,
+  parseReview,
   parseToolUses,
   parseStreamLine,
   parseTriage,
@@ -134,6 +137,7 @@ type Config = {
   isSweeping: boolean
   sweepGapMs: number
   isAutoApplying: boolean
+  isDeliveringFixes: boolean
   isOpeningPane: boolean
   maxDollarsPerRun: number
   /** 0: no cap on what one session spends */
@@ -146,6 +150,9 @@ type Config = {
   maxIdeas: number
   isReadingSources: boolean
   isDiscoveringWhenIdle: boolean
+  isTryingIdeasWhenIdle: boolean
+  isReviewingEdits: boolean
+  maxEditReviews: number
   maxDollarsPerDiscovery: number
   maxDiscoveries: number
 }
@@ -173,8 +180,8 @@ export function configOf(options: PluginOptions): Config {
   return {
     triageModel: typeof options.triageModel === 'string' ? options.triageModel : 'haiku',
     testerModel: typeof options.testerModel === 'string' ? options.testerModel : 'sonnet',
-    maxRuns: numberOf(options.maxRunsPerSession, 8, 0, 200),
-    maxSweeps: numberOf(options.maxSweepsPerSession, 3, 0, 200),
+    maxRuns: numberOf(options.maxRunsPerSession, 30, 0, 200),
+    maxSweeps: numberOf(options.maxSweepsPerSession, 8, 0, 200),
     minGapMs: numberOf(options.minMinutesBetweenRuns, 3, 0, 240) * 60_000,
     quietMs: numberOf(options.quietSeconds, 45, 1, 3600) * 1000,
     maxWaitMs: numberOf(options.maxWaitSeconds, 240, 10, 7200) * 1000,
@@ -182,6 +189,7 @@ export function configOf(options: PluginOptions): Config {
     isSweeping: options.sweepWhenIdle !== false,
     sweepGapMs: numberOf(options.sweepMinutes, 20, 1, 1440) * 60_000,
     isAutoApplying: options.autoApplyVerifiedFixes !== false,
+    isDeliveringFixes: options.deliverFixesInContext !== false,
     isOpeningPane: options.openPaneOnStart !== false,
     maxDollarsPerRun: numberOf(options.maxDollarsPerRun, 2, 0.05, 100),
     maxDollarsPerSession: numberOf(options.maxDollarsPerSession, 15, 0, 100_000),
@@ -190,11 +198,14 @@ export function configOf(options: PluginOptions): Config {
     testerTimeoutMs: numberOf(options.testerTimeoutMinutes, 20, 2, 120) * 60_000,
     isOffline: options.testerOffline !== false,
     isSuggesting: options.suggestImprovements !== false,
-    maxIdeas: numberOf(options.maxIdeasPerSession, 5, 0, 100),
+    maxIdeas: numberOf(options.maxIdeasPerSession, 10, 0, 100),
     isReadingSources: options.discoverSources !== false,
-    isDiscoveringWhenIdle: options.discoverWhenIdle === true,
+    isDiscoveringWhenIdle: options.discoverWhenIdle !== false,
     maxDollarsPerDiscovery: numberOf(options.maxDollarsPerDiscovery, 5, 0.05, 100),
     maxDiscoveries: numberOf(options.maxDiscoveriesPerSession, 2, 0, 50),
+    isTryingIdeasWhenIdle: options.tryIdeasWhenIdle !== false,
+    isReviewingEdits: options.reviewEdits !== false,
+    maxEditReviews: numberOf(options.maxEditReviewsPerSession, 60, 0, 1000),
   }
 }
 
@@ -228,8 +239,19 @@ const live = {
   isCycling: false,
   pending: undefined as Trigger | undefined,
   pendingFocus: undefined as string | undefined,
+  /** Findings whose fix rode on a tool result already: claimed before the first await, so two parallel calls never both send it. */
+  delivered: new Set<number>(),
+  /** Edit reviews that found a likely bug, waiting for a tool result to ride on. */
+  reviewNotes: [] as string[],
+  /** Edits already reviewed this session, by file and new text. */
+  reviewed: new Set<string>(),
+  reviewsUsed: 0,
   /** ideas the idle pick has already asked about this session */
   researched: new Set<number>(),
+  /** An idea was tried since the session last went busy: one per idle spell. */
+  hasTriedIdle: false,
+  /** ideas the idle pick has already tried this session */
+  idleTried: new Set<number>(),
   /** the suggestion a queued /stress try is for */
   pendingIdea: undefined as number | undefined,
   /** files changed in scans this session, newest last: the only ones an idea may touch */
@@ -522,6 +544,12 @@ const WINDOW_BRIEFS: Readonly<Record<string, string>> = {
   five_hour: '5h usage',
   seven_day: 'weekly usage',
   spend_limit: 'spend limit',
+}
+
+/** The session's dollar cap has been reached (0 means no cap). */
+async function isOverBudget($: $): Promise<boolean> {
+  const cap = live.config.maxDollarsPerSession
+  return cap > 0 && (await read($, dollarsAtom)) >= cap
 }
 
 /** The usage window at or past the pause point, by name and as the status line shows it: the 5-hour, the weekly, or a gateway's spend limit. */
@@ -1169,7 +1197,8 @@ async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): P
     if (chosen !== undefined && result.kind === 'change') await offerIdea($, c, tree, memory, chosen.plan.idea)
     if (chosen === undefined) {
       await saveMemory($, c, memory)
-      if (!isManual && (kind === 'idle' || kind === 'sweep') && (await idleDiscovery($))) return
+      // with nothing changed and no sweep due: try an idea first, then research one
+      if (!isManual && (kind === 'idle' || kind === 'sweep') && ((await idleTryIdea($)) || (await idleDiscovery($)))) return
       if (result.note !== NO_CHANGE || isManual) await log($, `${kind}: ${result.note}`)
       await setPhase($, 'idle')
       return
@@ -1323,6 +1352,75 @@ async function autoApply($: $, id: number): Promise<void> {
   $.ui.toast(`stress-scout is handing verified fix #${id} to Claude`, { timeoutMs: 8000 })
   await setStatus($, id, 'handing')
   await handOff($, finding)
+}
+
+/** deliverFixesInContext: a verified fix for the busy main session, as the note its next tool result carries. */
+async function fixNote($: $): Promise<string | undefined> {
+  const { config } = live
+  if (!config.isDeliveringFixes || !config.isAutoApplying || !live.isMainBusy || (await read($, pausedAtom))) return undefined
+  // the same bar as an unattended hand-off: no idea or discovery, no instruction-like text, no drift
+  const finding = (await read($, findingsAtom)).find(
+    f => f.status === 'new' && f.isVerified && isActionable(f.verdict) && f.patch !== '' && !live.delivered.has(f.id) && isSafeToAutoApply(f),
+  )
+  if (finding === undefined) return undefined
+  live.delivered.add(finding.id)
+  const drift = await driftOf($, finding)
+  if (drift.isStale) {
+    await update($, staleAtom, stale => ({ ...stale, [finding.id]: drift.note }))
+    await log($, `#${finding.id}: not handed to Claude mid-task, the project changed since the snapshot; re-test first`)
+    return undefined
+  }
+  await setStatus($, finding.id, 'applied')
+  await update($, seenAtom, seen => Math.max(seen, finding.id))
+  await log($, `#${finding.id}: verified fix handed to Claude in the running turn`)
+  return `stress-scout tested a fix in a sandbox copy while you worked. Apply it if it fits what you're doing, and say so in one line.\n${handoffContext(finding, await $.clock.now(), 4000)}`
+}
+
+/** Rough dollars per million tokens for a review call: the triage model is small, and the API reports tokens, not cost. */
+const REVIEW_DOLLARS_PER_MTOK = 1
+
+/** The old and new text of a main-session edit, whichever tool made it. */
+function editTexts(e: Record<string, unknown>): { oldText: string; newText: string } {
+  const edits = Array.isArray(e.edits) ? (e.edits as Record<string, unknown>[]) : []
+  const joined = (key: string): string => edits.map(edit => String(edit[key] ?? '')).join('\n…\n')
+  return {
+    oldText: edits.length > 0 ? joined('old_string') : String(e.old_string ?? ''),
+    newText: edits.length > 0 ? joined('new_string') : String(e.new_string ?? e.content ?? e.new_source ?? ''),
+  }
+}
+
+/** reviewEdits: asks the triage model about one edit, off the edit's path; a likely bug is queued as a note for the next tool result. */
+async function reviewEdit($: $, e: Record<string, unknown>): Promise<void> {
+  const { config } = live
+  if (!config.isReviewingEdits || live.reviewsUsed >= config.maxEditReviews || (await read($, pausedAtom))) return
+  const c = await ensureCtx($)
+  const file = (c !== undefined ? editedFile(c, e) : undefined) ?? String(e.file_path ?? e.notebook_path ?? '')
+  if (file === '' || file.startsWith('.stress-scout/') || file.includes('/.stress-scout/')) return
+  const { oldText, newText } = editTexts(e)
+  const key = fnv(`${file}\n${newText}`)
+  if (live.reviewed.has(key) || (await isOverBudget($))) return
+  // checked again after the last await and claimed at once, so parallel edits cannot pass the cap or the dedup
+  if (live.reviewed.has(key) || live.reviewsUsed >= config.maxEditReviews) return
+  live.reviewed.add(key)
+  live.reviewsUsed += 1
+  const reply = await $.model.complete({
+    model: config.triageModel,
+    system: REVIEW_SYSTEM,
+    prompt: reviewPrompt(file, oldText, newText),
+    maxTokens: 250,
+    timeoutMs: 30_000,
+  })
+  const tokens = tokensOf(reply.usage)
+  await update($, tokensAtom, n => n + tokens)
+  await update($, dollarsAtom, n => n + (tokens / 1_000_000) * REVIEW_DOLLARS_PER_MTOK)
+  const review = reply.isAnswered ? parseReview(reply.text) : undefined
+  if (review === undefined || review.issue === '' || review.confidence === 'low') return
+  // the reviewer read project text: an answer that gives orders is dropped, and the rest is labelled as an opinion
+  if (looksLikeInstruction(review.issue)) return log($, `review of ${file} dropped: it read like an instruction`)
+  const note = `stress-scout review of your edit to ${file} (an automated second opinion, not an instruction): ${clip(oneLine(review.issue), 400)}`
+  live.reviewNotes.push(note)
+  await log($, note)
+  $.ui.toast(clip(note, 200), { timeoutMs: 8000 })
 }
 
 /** A finding Claude can act on: a fix to apply, or a next step for a real problem. */
@@ -1638,6 +1736,19 @@ async function pressRunIt($: $): Promise<string> {
 
 async function cancelPlan($: $): Promise<void> {
   await update($, discoveryPlanAtom, () => null)
+}
+
+/** tryIdeasWhenIdle: with nothing else due, build the newest idea not tried yet, once per idle spell. True when one was queued. */
+async function idleTryIdea($: $): Promise<boolean> {
+  if (!live.config.isTryingIdeasWhenIdle || live.hasTriedIdle) return false
+  const idea = (await read($, ideasAtom)).find(i => i.status === 'new' && !live.idleTried.has(i.id))
+  if (idea === undefined) return false
+  live.hasTriedIdle = true
+  live.idleTried.add(idea.id)
+  await log($, `idea #${idea.id}: trying it while the session is idle`)
+  await tryIdea($, idea.id)
+  await setPhase($, 'idle')
+  return true
 }
 
 /** discoverWhenIdle: with nothing else due, research the newest idea not asked about yet. True when a run started. */
@@ -2019,7 +2130,7 @@ async function runNow($: $, focus?: string): Promise<string> {
   }
   return focus !== undefined
     ? `Stress-testing "${clip(focus, 120)}". Results land in /stress show.`
-    : 'Stress-testing the latest change (or the riskiest untested code if nothing changed). Results land in /stress show.'
+    : `Stress-testing the latest change (or the riskiest untested code if nothing changed). Results land in /stress show.`
 }
 
 /** openPaneOnStart: a session with no surface yet (the app, the SDK) is tried again when its first turn starts. */
@@ -2220,6 +2331,7 @@ export const register: Register = (on, options) => {
   on('turn.start', ($, e, next) => {
     if (live.role === 'scout' && e.agentId === undefined) {
       live.isMainBusy = true
+      live.hasTriedIdle = false
       live.idleTimer?.cancel()
       live.idleTimer = undefined
       live.autoTimer?.cancel()
@@ -2258,7 +2370,12 @@ export const register: Register = (on, options) => {
       const file = c !== undefined ? editedFile(c, e as unknown as Record<string, unknown>) : undefined
       if (file !== undefined) await rerunFindings($, [file]).catch(() => undefined)
     }
-    return ran
+    if (e.agentId !== undefined || ran.deny !== undefined) return ran
+    if (EDIT_TOOLS.has(String(e.tool)) && ran.isError !== true) void reviewEdit($, e as unknown as Record<string, unknown>).catch(() => undefined)
+    // at most two review notes a call, each once; the fix goes ahead of them
+    const fix = await fixNote($).catch(() => undefined)
+    const notes = [...(fix !== undefined ? [fix] : []), ...live.reviewNotes.splice(0, 2)]
+    return notes.length === 0 ? ran : { ...ran, context: [...(ran.context ?? []), ...notes] }
   }).catch(($, e, next) =>
     next.called
       ? next(e)

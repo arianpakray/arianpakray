@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
@@ -23,13 +23,13 @@
       "type": "number",
       "title": "Max automatic test runs per session",
       "description": "Hard cap on automatic deep runs; /stress still runs on demand.",
-      "default": 8
+      "default": 30
     },
     "maxSweepsPerSession": {
       "type": "number",
       "title": "Max idle sweeps per session",
       "description": "How many of the automatic runs may go to idle sweeps of untested code.",
-      "default": 3
+      "default": 8
     },
     "minMinutesBetweenRuns": {
       "type": "number",
@@ -85,6 +85,24 @@
       "description": "When a test proves its own fix and the session has been idle for the idle seconds, send the fix to Claude without a tap.",
       "default": true
     },
+    "deliverFixesInContext": {
+      "type": "boolean",
+      "title": "Hand verified fixes over mid-task",
+      "description": "When a fix is verified while Claude is working, attach it to Claude's next tool result instead of waiting for the turn to end. Needs automatic hand-off on; off keeps the idle hand-off only.",
+      "default": true
+    },
+    "reviewEdits": {
+      "type": "boolean",
+      "title": "Review each edit",
+      "description": "After each edit Claude makes, the triage model reads it once and, when it sees a likely bug, tells Claude on its next tool result and shows a toast. Costs a few cents an hour.",
+      "default": true
+    },
+    "maxEditReviewsPerSession": {
+      "type": "number",
+      "title": "Max edit reviews per session",
+      "description": "Hard cap on edits reviewed in one session.",
+      "default": 60
+    },
     "testerOffline": {
       "type": "boolean",
       "title": "Run the tester without network",
@@ -101,7 +119,13 @@
       "type": "number",
       "title": "Max ideas per session",
       "description": "Hard cap on suggested improvements shown in one session.",
-      "default": 5
+      "default": 10
+    },
+    "tryIdeasWhenIdle": {
+      "type": "boolean",
+      "title": "Try an idea when idle",
+      "description": "When nothing else is due, build and check the newest idea in the sandbox, once per idle spell, without waiting for Try it. Counts toward the run cap and the session budget.",
+      "default": true
     },
     "discoverSources": {
       "type": "boolean",
@@ -112,8 +136,8 @@
     "discoverWhenIdle": {
       "type": "boolean",
       "title": "Research an idea when idle",
-      "description": "When nothing else is due, research the newest idea without waiting for Run it. Off: a discovery only starts when you press Run it.",
-      "default": false
+      "description": "On by default: when nothing else is due, research the newest idea without waiting for Run it. Off: a discovery only starts when you press Run it.",
+      "default": true
     },
     "maxDollarsPerDiscovery": {
       "type": "number",
@@ -130,7 +154,7 @@
     "maxDollarsPerSession": {
       "type": "number",
       "title": "Max dollars per session",
-      "description": "No test starts (automatic or on demand) if what this session has spent plus the cost cap of one more test would pass this. 0 turns the cap off.",
+      "description": "No test starts (automatic or on demand) if what this session has spent plus the cost cap of one more test would pass this; edit reviews stop at it too. 0 turns the cap off.",
       "default": 15
     },
     "claudePath": {
