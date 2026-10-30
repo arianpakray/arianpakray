@@ -141,6 +141,7 @@ type Config = {
   maxIdeas: number
   isReadingSources: boolean
   isDiscoveringWhenIdle: boolean
+  isTryingIdeasWhenIdle: boolean
   isReviewingEdits: boolean
   maxEditReviews: number
   maxDollarsPerDiscovery: number
@@ -193,6 +194,7 @@ export function configOf(options: PluginOptions): Config {
     isDiscoveringWhenIdle: options.discoverWhenIdle !== false,
     maxDollarsPerDiscovery: numberOf(options.maxDollarsPerDiscovery, 5, 0.05, 100),
     maxDiscoveries: numberOf(options.maxDiscoveriesPerSession, 2, 0, 50),
+    isTryingIdeasWhenIdle: options.tryIdeasWhenIdle !== false,
     isReviewingEdits: options.reviewEdits !== false,
     maxEditReviews: numberOf(options.maxEditReviewsPerSession, 60, 0, 1000),
     maxDollarsPerSession: numberOf(options.maxDollarsPerSession, 15, 0, 10_000),
@@ -238,6 +240,10 @@ const live = {
   reviewsUsed: 0,
   /** ideas the idle pick has already asked about this session */
   researched: new Set<number>(),
+  /** An idea was tried since the session last went busy: one per idle spell. */
+  hasTriedIdle: false,
+  /** ideas the idle pick has already tried this session */
+  idleTried: new Set<number>(),
   /** the suggestion a queued /stress try is for */
   pendingIdea: undefined as number | undefined,
   /** files changed in scans this session, newest last: the only ones an idea may touch */
@@ -1111,7 +1117,8 @@ async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): P
     if (chosen !== undefined && result.kind === 'change') await offerIdea($, c, tree, memory, chosen.plan.idea)
     if (chosen === undefined) {
       await saveMemory($, c, memory)
-      if (!isManual && (kind === 'idle' || kind === 'sweep') && (await idleDiscovery($))) return
+      // with nothing changed and no sweep due: try an idea first, then research one
+      if (!isManual && (kind === 'idle' || kind === 'sweep') && ((await idleTryIdea($)) || (await idleDiscovery($)))) return
       if (result.note !== NO_CHANGE || isManual) await log($, `${kind}: ${result.note}`)
       await setPhase($, 'idle')
       return
@@ -1596,6 +1603,19 @@ async function pressRunIt($: $): Promise<string> {
 
 async function cancelPlan($: $): Promise<void> {
   await update($, discoveryPlanAtom, () => null)
+}
+
+/** tryIdeasWhenIdle: with nothing else due, build the newest idea not tried yet, once per idle spell. True when one was queued. */
+async function idleTryIdea($: $): Promise<boolean> {
+  if (!live.config.isTryingIdeasWhenIdle || live.hasTriedIdle) return false
+  const idea = (await read($, ideasAtom)).find(i => i.status === 'new' && !live.idleTried.has(i.id))
+  if (idea === undefined) return false
+  live.hasTriedIdle = true
+  live.idleTried.add(idea.id)
+  await log($, `idea #${idea.id}: trying it while the session is idle`)
+  await tryIdea($, idea.id)
+  await setPhase($, 'idle')
+  return true
 }
 
 /** discoverWhenIdle: with nothing else due, research the newest idea not asked about yet. True when a run started. */
@@ -2114,6 +2134,7 @@ export const register: Register = (on, options) => {
   on('turn.start', ($, e, next) => {
     if (live.role === 'scout' && e.agentId === undefined) {
       live.isMainBusy = true
+      live.hasTriedIdle = false
       live.idleTimer?.cancel()
       live.idleTimer = undefined
       live.autoTimer?.cancel()

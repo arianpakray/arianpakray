@@ -127,6 +127,12 @@
       "description": "Hard cap on suggested improvements shown in one session.",
       "default": 10
     },
+    "tryIdeasWhenIdle": {
+      "type": "boolean",
+      "title": "Try an idea when idle",
+      "description": "When nothing else is due, build and check the newest idea in the sandbox, once per idle spell, without waiting for Try it. Counts toward the run cap and the session budget.",
+      "default": true
+    },
     "discoverSources": {
       "type": "boolean",
       "title": "Discovery may read fresh sources",

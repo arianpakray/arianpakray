@@ -2302,7 +2302,7 @@ describe('discovery scout', () => {
       expect(w.spawned[0]?.input).toContain('LIKELY RELEVANT FILES: src/cache.ts')
     })
 
-    test('discoverWhenIdle researches the newest idea once the session sits idle', { timeoutMs: 30_000, options: { discoverWhenIdle: true, sweepWhenIdle: false } }, async ($, on) => {
+    test('discoverWhenIdle researches the newest idea once the session sits idle', { timeoutMs: 30_000, options: { discoverWhenIdle: true, sweepWhenIdle: false, tryIdeasWhenIdle: false } }, async ($, on) => {
       const { clock, w } = await withIdea($, on)
       registersFirst(w)
       expect(w.spawned).toHaveLength(0)
@@ -2315,6 +2315,36 @@ describe('discovery scout', () => {
       expect(w.spawned).toHaveLength(1)
     })
 
+    test('by default an idle session tries the newest idea in the sandbox, once, ahead of researching it', { timeoutMs: 30_000, options: { sweepWhenIdle: false } }, async ($, on) => {
+      const { clock, w } = await withIdea($, on)
+      expect(w.spawned).toHaveLength(0)
+      await sitIdle($, clock)
+      await clock.advance(5_000)
+      await clock.settle()
+      expect(w.spawned).toHaveLength(1)
+      expect(w.spawned[0]?.input).toContain('IMPROVEMENT TO TRY (idea #1, size S; not a bug hunt): Show the eviction count in the cache stats')
+      expect((await $.command.run(stress('status') as never)).text).toContain('idea #1 (S) Show the eviction count in the cache stats [tried]')
+      // it counted as a run, and the idea is not tried or researched again
+      expect(w.statuses.at(-1)).toMatch(/watching · 1\/30 runs/)
+      await clock.advance(10 * 60_000)
+      await sitIdle($, clock)
+      await clock.advance(5_000)
+      await clock.settle()
+      expect(w.spawned).toHaveLength(1)
+    })
+
+    test('an idle session leaves the idea alone while paused and at the run cap', { timeoutMs: 30_000, options: { sweepWhenIdle: false, discoverWhenIdle: false, maxRunsPerSession: 0 } }, async ($, on) => {
+      const { clock, w } = await withIdea($, on)
+      await $.command.run(stress('pause') as never)
+      await sitIdle($, clock)
+      await $.command.run(stress('resume') as never)
+      await clock.advance(10 * 60_000)
+      await sitIdle($, clock)
+      await clock.advance(5_000)
+      await clock.settle()
+      expect(w.spawned).toHaveLength(0)
+    })
+
     test('by default an idle session researches the newest idea', { timeoutMs: 30_000, options: { sweepWhenIdle: false, tryIdeasWhenIdle: false } }, async ($, on) => {
       const { clock, w } = await withIdea($, on)
       registersFirst(w)
@@ -2323,7 +2353,7 @@ describe('discovery scout', () => {
       expect(w.spawned[0]?.input).toContain('QUESTION: Does this pay off in this codebase: Show the eviction count')
     })
 
-    test('with discoverWhenIdle off an idle session starts no discovery', { timeoutMs: 30_000, options: { discoverWhenIdle: false, sweepWhenIdle: false } }, async ($, on) => {
+    test('with discoverWhenIdle off an idle session starts no discovery', { timeoutMs: 30_000, options: { discoverWhenIdle: false, sweepWhenIdle: false, tryIdeasWhenIdle: false } }, async ($, on) => {
       const { clock, w } = await withIdea($, on)
       await sitIdle($, clock)
       await clock.advance(10 * 60_000)
