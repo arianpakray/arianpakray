@@ -1399,7 +1399,8 @@ async function reviewEdit($: $, e: Record<string, unknown>): Promise<void> {
   const { oldText, newText } = editTexts(e)
   const key = fnv(`${file}\n${newText}`)
   if (live.reviewed.has(key) || (await isOverBudget($))) return
-  // claimed before the model answers, so parallel edits cannot pass the cap
+  // checked again after the last await and claimed at once, so parallel edits cannot pass the cap or the dedup
+  if (live.reviewed.has(key) || live.reviewsUsed >= config.maxEditReviews) return
   live.reviewed.add(key)
   live.reviewsUsed += 1
   const reply = await $.model.complete({
