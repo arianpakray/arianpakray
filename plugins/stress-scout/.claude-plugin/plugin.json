@@ -67,12 +67,6 @@
       "description": "Minimum gap between two idle sweeps.",
       "default": 20
     },
-    "maxDollarsPerSession": {
-      "type": "number",
-      "title": "Max dollars per session",
-      "description": "Automatic work (runs, sweeps, idea tries, discoveries, edit reviews) stops at this total cost for the session; 0 means no cap. /stress still runs on demand.",
-      "default": 15
-    },
     "maxDollarsPerRun": {
       "type": "number",
       "title": "Max dollars per test run",
@@ -156,6 +150,12 @@
       "title": "Max discoveries per session",
       "description": "Hard cap on discoveries started in one session; 0 turns discovery off.",
       "default": 2
+    },
+    "maxDollarsPerSession": {
+      "type": "number",
+      "title": "Max dollars per session",
+      "description": "No test starts (automatic or on demand) if what this session has spent plus the cost cap of one more test would pass this; edit reviews stop at it too. 0 turns the cap off.",
+      "default": 15
     },
     "claudePath": {
       "type": "string",
