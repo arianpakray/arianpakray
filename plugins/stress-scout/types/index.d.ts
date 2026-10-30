@@ -179,6 +179,10 @@ declare module 'claude-code' {
       /** What the next automatic run waits on, when that is a time or a limit; '' when it just waits for an edit. */
       waiting: string
       rateHold: string
+      /** Findings whose project moved on since their snapshot, by id, with how: a re-test is offered, and none is handed over unattended. */
+      stale: Record<number, string>
+      /** How the tester's commands reach the network as the last run found it (`off (sandbox-exec)`, `guard only`, `on (Windows)`); '' before the first run. */
+      network: string
     }
   }
 }

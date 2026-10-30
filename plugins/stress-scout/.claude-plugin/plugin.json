@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
@@ -126,6 +126,12 @@
       "title": "Max discoveries per session",
       "description": "Hard cap on discoveries started in one session; 0 turns discovery off.",
       "default": 2
+    },
+    "maxDollarsPerSession": {
+      "type": "number",
+      "title": "Max dollars per session",
+      "description": "No test starts (automatic or on demand) if what this session has spent plus the cost cap of one more test would pass this. 0 turns the cap off.",
+      "default": 15
     },
     "claudePath": {
       "type": "string",
