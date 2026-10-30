@@ -3,7 +3,7 @@ import { expect, test } from 'claude-code/testing'
 import { isSource, parseChurn, parseLsTree, rankCandidates } from '../hooks/lib/rank'
 import { vetIdea } from '../hooks/lib/ideas'
 import { checkPreRegistration, fingerprintOf, normalizeQuestion, questionKey } from '../hooks/lib/discovery'
-import { parseDiscovery, parseReport, parseToolUses, parseTriage, type IdeaDraft } from '../hooks/lib/report'
+import { parseDiscovery, parseReport, parseReview, parseToolUses, parseTriage, type IdeaDraft } from '../hooks/lib/report'
 import { extractJson } from '../hooks/lib/util'
 import { configOf } from '../hooks/register'
 
@@ -217,4 +217,12 @@ test('the defaults watch harder: more runs, sweeps and ideas, idle research on, 
   expect(config.isDiscoveringWhenIdle).toBe(true)
   expect(configOf({ maxDollarsPerSession: 0 }).maxDollarsPerSession).toBe(0)
   expect(configOf({ discoverWhenIdle: false }).isDiscoveringWhenIdle).toBe(false)
+})
+
+test('the reviewer\'s answer is read from json, and an unreadable one is dropped', () => {
+  expect(parseReview('{"issue": "off by one", "confidence": "high"}')).toEqual({ issue: 'off by one', confidence: 'high' })
+  expect(parseReview('Fine.\n```json\n{"issue": "", "confidence": "medium"}\n```')).toEqual({ issue: '', confidence: 'medium' })
+  expect(parseReview('{"issue": "x", "confidence": "certain"}')?.confidence).toBe('low')
+  expect(parseReview('looks fine to me')).toBeUndefined()
+  expect(parseReview('{"verdict": "ok"}')).toBeUndefined()
 })

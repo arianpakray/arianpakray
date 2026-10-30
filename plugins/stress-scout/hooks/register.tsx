@@ -18,6 +18,7 @@ import {
   HANDOFF,
   HANDOFF_DETAILS,
   IDEA_SYSTEM,
+  REVIEW_SYSTEM,
   TESTER_SYSTEM,
   TRIAGE_SYSTEM,
   changeTriagePrompt,
@@ -26,6 +27,7 @@ import {
   handoffContext,
   handoffMessage,
   handoffPrompt,
+  reviewPrompt,
   PLUGIN_TYPES,
   sweepTriagePrompt,
   testerTask,
@@ -51,6 +53,7 @@ import {
   isActionable,
   parseDiscovery,
   parseReport,
+  parseReview,
   parseToolUses,
   parseStreamLine,
   parseTriage,
@@ -138,6 +141,8 @@ type Config = {
   maxIdeas: number
   isReadingSources: boolean
   isDiscoveringWhenIdle: boolean
+  isReviewingEdits: boolean
+  maxEditReviews: number
   maxDollarsPerDiscovery: number
   maxDiscoveries: number
   maxDollarsPerSession: number
@@ -188,6 +193,8 @@ export function configOf(options: PluginOptions): Config {
     isDiscoveringWhenIdle: options.discoverWhenIdle !== false,
     maxDollarsPerDiscovery: numberOf(options.maxDollarsPerDiscovery, 5, 0.05, 100),
     maxDiscoveries: numberOf(options.maxDiscoveriesPerSession, 2, 0, 50),
+    isReviewingEdits: options.reviewEdits !== false,
+    maxEditReviews: numberOf(options.maxEditReviewsPerSession, 60, 0, 1000),
     maxDollarsPerSession: numberOf(options.maxDollarsPerSession, 15, 0, 10_000),
   }
 }
@@ -224,6 +231,11 @@ const live = {
   pendingFocus: undefined as string | undefined,
   /** Findings whose fix rode on a tool result already: claimed before the first await, so two parallel calls never both send it. */
   delivered: new Set<number>(),
+  /** Edit reviews that found a likely bug, waiting for a tool result to ride on. */
+  reviewNotes: [] as string[],
+  /** Edits already reviewed this session, by file and new text. */
+  reviewed: new Set<string>(),
+  reviewsUsed: 0,
   /** ideas the idle pick has already asked about this session */
   researched: new Set<number>(),
   /** the suggestion a queued /stress try is for */
@@ -1242,6 +1254,50 @@ async function fixNote($: $): Promise<string | undefined> {
   return `stress-scout (tested in a sandbox copy): ${said}. Verified fix for ${finding.target}: ${finding.fixSummary}. Patch:\n${clip(finding.patch, 4000)}\nApply it if it fits what you're doing; say so in one line.`
 }
 
+/** Rough dollars per million tokens for a review call: the triage model is small, and the API reports tokens, not cost. */
+const REVIEW_DOLLARS_PER_MTOK = 1
+
+/** The old and new text of a main-session edit, whichever tool made it. */
+function editTexts(e: Record<string, unknown>): { oldText: string; newText: string } {
+  const edits = Array.isArray(e.edits) ? (e.edits as Record<string, unknown>[]) : []
+  const joined = (key: string): string => edits.map(edit => String(edit[key] ?? '')).join('\n…\n')
+  return {
+    oldText: edits.length > 0 ? joined('old_string') : String(e.old_string ?? ''),
+    newText: edits.length > 0 ? joined('new_string') : String(e.new_string ?? e.content ?? e.new_source ?? ''),
+  }
+}
+
+/** reviewEdits: asks the triage model about one edit, off the edit's path; a likely bug is queued as a note for the next tool result. */
+async function reviewEdit($: $, e: Record<string, unknown>): Promise<void> {
+  const { config } = live
+  if (!config.isReviewingEdits || live.reviewsUsed >= config.maxEditReviews || (await read($, pausedAtom))) return
+  const c = await ensureCtx($)
+  const file = (c !== undefined ? editedFile(c, e) : undefined) ?? String(e.file_path ?? e.notebook_path ?? '')
+  if (file === '' || file.startsWith('.stress-scout/') || file.includes('/.stress-scout/')) return
+  const { oldText, newText } = editTexts(e)
+  const key = fnv(`${file}\n${newText}`)
+  if (live.reviewed.has(key) || (await isOverBudget($))) return
+  // claimed before the model answers, so parallel edits cannot pass the cap
+  live.reviewed.add(key)
+  live.reviewsUsed += 1
+  const reply = await $.model.complete({
+    model: config.triageModel,
+    system: REVIEW_SYSTEM,
+    prompt: reviewPrompt(file, oldText, newText),
+    maxTokens: 250,
+    timeoutMs: 30_000,
+  })
+  const tokens = tokensOf(reply.usage)
+  await update($, tokensAtom, n => n + tokens)
+  await update($, dollarsAtom, n => n + (tokens / 1_000_000) * REVIEW_DOLLARS_PER_MTOK)
+  const review = reply.isAnswered ? parseReview(reply.text) : undefined
+  if (review === undefined || review.issue === '' || review.confidence === 'low') return
+  const note = `stress-scout review of your edit to ${file}: ${review.issue}`
+  live.reviewNotes.push(note)
+  await log($, note)
+  $.ui.toast(clip(note, 200), { timeoutMs: 8000 })
+}
+
 /** A finding Claude can act on: a fix to apply, or a next step for a real problem. */
 const canHandOver = (f: Finding): boolean => f.patch !== '' || (isActionable(f.verdict) && f.nextStep !== '')
 
@@ -2097,8 +2153,11 @@ export const register: Register = (on, options) => {
       if (file !== undefined) await rerunFindings($, [file]).catch(() => undefined)
     }
     if (e.agentId !== undefined || ran.deny !== undefined) return ran
-    const note = await fixNote($).catch(() => undefined)
-    return note === undefined ? ran : { ...ran, context: [...(ran.context ?? []), note] }
+    if (EDIT_TOOLS.has(String(e.tool)) && ran.isError !== true) void reviewEdit($, e as unknown as Record<string, unknown>).catch(() => undefined)
+    // at most two review notes a call, each once; the fix goes ahead of them
+    const fix = await fixNote($).catch(() => undefined)
+    const notes = [...(fix !== undefined ? [fix] : []), ...live.reviewNotes.splice(0, 2)]
+    return notes.length === 0 ? ran : { ...ran, context: [...(ran.context ?? []), ...notes] }
   }).catch(($, e, next) =>
     next.called
       ? next(e)

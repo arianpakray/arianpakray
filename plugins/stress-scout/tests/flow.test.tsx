@@ -122,6 +122,11 @@ type World = {
   triagePrompts: string[]
   /** the triage model's next answer */
   triage: string
+  /** the prompts the edit reviewer was asked, and its next answer */
+  reviews: string[]
+  review: string
+  /** While set, the reviewer does not answer. */
+  reviewGate: Promise<void> | undefined
   /** the files git reports as changed and as present in every tree */
   files: string[]
   /** A slash command's hook is running: the host refuses a prompt.submit then, as the real one does. */
@@ -187,6 +192,9 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     writes: new Map(),
     triagePrompts: [],
     triage: TRIAGE,
+    reviews: [],
+    reviewGate: undefined,
+    review: JSON.stringify({ issue: '', confidence: 'low' }),
     files: ['src/cache.ts'],
     isInCommand: false,
     missingTrees: new Set(),
@@ -285,7 +293,12 @@ function world(on: On, stored: Readonly<Record<string, unknown>> = {}, place: Pl
     yield { stream: 'stdout' as const, text: JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: w.reports.shift() ?? REPORT, total_cost_usd: 0.42, usage: USAGE, ...w.result }) }
     return { value: { code: 0, signal: null } }
   } as never)
-  on('model.complete', ($, e) => {
+  on('model.complete', async ($, e) => {
+    if (String(e.system).includes('senior reviewer')) {
+      w.reviews.push(String(e.prompt))
+      await w.reviewGate
+      return { value: { isAnswered: true as const, text: w.review, usage: USAGE } }
+    }
     w.triagePrompts.push(String(e.prompt))
     return { value: { isAnswered: true as const, text: w.triage, usage: USAGE } }
   })
@@ -718,6 +731,118 @@ test('by default, a verified fix goes to Claude once the session sits idle', { t
   await clock.advance(5 * 60_000)
   await clock.settle()
   expect(w.submitted).toHaveLength(1)
+})
+
+describe('edit review', () => {
+  const BUG = JSON.stringify({ issue: 'the loop stops one item early, so the last key is never evicted', confidence: 'high' })
+  const edit = (n: number, file = 'src/cache.ts') => ({ tool: 'Edit', file_path: `${ROOT}/${file}`, old_string: 'i < n', new_string: `i <= n - ${n}` })
+  async function started($: Engine, on: On, review = BUG) {
+    const clock = mock.clock(on, { now: 1_700_000_000_000 })
+    const w = world(on)
+    w.review = review
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    return { clock, w }
+  }
+
+  test('a likely bug in an edit reaches Claude on its next tool result, once, with a toast', { timeoutMs: 30_000 }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    // the edit's own result is not held up for the review
+    expect(contextOf(await toolCall($, edit(1)))).toHaveLength(0)
+    await clock.settle()
+    expect(w.reviews).toHaveLength(1)
+    expect(w.reviews[0]).toContain('FILE: src/cache.ts')
+    expect(w.reviews[0]).toContain('OLD TEXT:\ni < n')
+    expect(w.reviews[0]).toContain('NEW TEXT:\ni <= n - 1')
+    expect(w.toasts.at(-1)).toContain('stress-scout review of your edit to src/cache.ts: the loop stops one item early')
+    // a review is not a stress test: the triage model was not asked
+    expect(w.triagePrompts).toHaveLength(0)
+
+    const carried = contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/src/cache.ts` }))
+    expect(carried).toEqual(['stress-scout review of your edit to src/cache.ts: the loop stops one item early, so the last key is never evicted'])
+    expect(contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/src/cache.ts` }))).toHaveLength(0)
+    // the review's tokens count toward the session
+    expect((await $.command.run(stress('status') as never)).text).toContain('1k tokens')
+  })
+
+  test('at most two notes ride on one tool result; the rest wait for the next', { timeoutMs: 30_000 }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    // the answers arrive after all three edits, so none of the edits' own results carries a note
+    let release = () => {}
+    w.reviewGate = new Promise<void>(resolve => (release = resolve))
+    for (const n of [1, 2, 3]) expect(contextOf(await toolCall($, edit(n, `src/f${n}.ts`)))).toHaveLength(0)
+    release()
+    await clock.settle()
+    await clock.advance(1_000)
+    await clock.settle()
+    expect(w.reviews).toHaveLength(3)
+    const read = { tool: 'Read', file_path: `${ROOT}/a.ts` }
+    expect(contextOf(await toolCall($, read))).toHaveLength(2)
+    expect(contextOf(await toolCall($, read))).toHaveLength(1)
+    expect(contextOf(await toolCall($, read))).toHaveLength(0)
+  })
+
+  for (const [name, review] of [
+    ['finds fine', JSON.stringify({ issue: '', confidence: 'high' })],
+    ['doubts', JSON.stringify({ issue: 'maybe off by one', confidence: 'low' })],
+    ['cannot put in json', 'no json at all'],
+  ] as const) {
+    test(`an edit the reviewer ${name} says nothing`, { timeoutMs: 30_000 }, async ($, on) => {
+      const { clock, w } = await started($, on, review)
+      await toolCall($, edit(1))
+      await clock.settle()
+      expect(w.reviews).toHaveLength(1)
+      expect(contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/a.ts` }))).toHaveLength(0)
+      expect(w.toasts.filter(t => t.includes('review of your edit'))).toHaveLength(0)
+    })
+  }
+
+  test('edits under .stress-scout, repeats and subagent edits are not reviewed', { timeoutMs: 30_000 }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    await toolCall($, edit(1, '.stress-scout/race.mjs'))
+    await toolCall($, { ...edit(2), agentId: 'sub-1' })
+    await clock.settle()
+    expect(w.reviews).toHaveLength(0)
+    await toolCall($, edit(3))
+    await toolCall($, edit(3))
+    await toolCall($, edit(3, 'src/other.ts'))
+    await clock.settle()
+    // the same file and text once; the same text in another file is a new edit
+    expect(w.reviews).toHaveLength(2)
+  })
+
+  test('Write and MultiEdit are reviewed with the content they add', { timeoutMs: 30_000 }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/new.ts`, content: 'export const x = 1' })
+    await toolCall($, { tool: 'MultiEdit', file_path: `${ROOT}/src/m.ts`, edits: [{ old_string: 'a', new_string: 'b' }, { old_string: 'c', new_string: 'd' }] })
+    await clock.settle()
+    expect(w.reviews[0]).toContain('NEW TEXT:\nexport const x = 1')
+    expect(w.reviews[1]).toContain('OLD TEXT:\na\n…\nc')
+    expect(w.reviews[1]).toContain('NEW TEXT:\nb\n…\nd')
+  })
+
+  test('maxEditReviewsPerSession caps the reviews', { timeoutMs: 30_000, options: { maxEditReviewsPerSession: 2 } }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    for (const n of [1, 2, 3, 4]) await toolCall($, edit(n))
+    await clock.settle()
+    expect(w.reviews).toHaveLength(2)
+  })
+
+  test('reviewEdits off asks the model nothing', { timeoutMs: 30_000, options: { reviewEdits: false } }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    await toolCall($, edit(1))
+    await clock.settle()
+    expect(w.reviews).toHaveLength(0)
+  })
+
+  test('the session dollar cap stops reviews', { timeoutMs: 30_000, options: { maxDollarsPerSession: 0.0005 } }, async ($, on) => {
+    const { clock, w } = await started($, on)
+    // the first review costs about $0.001, past the cap
+    await toolCall($, edit(1))
+    await clock.settle()
+    await toolCall($, edit(2))
+    await clock.settle()
+    expect(w.reviews).toHaveLength(1)
+  })
 })
 
 /** A verified fix waiting for a tap (autoApplyVerifiedFixes off). */

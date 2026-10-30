@@ -125,6 +125,16 @@ function parseIdea(value: unknown): IdeaDraft | undefined {
   }
 }
 
+/** What the reviewer saw in one edit: '' when it found nothing. */
+export type Review = { issue: string; confidence: 'high' | 'medium' | 'low' }
+
+/** The reviewer's JSON answer; undefined when it is unreadable. */
+export function parseReview(text: string): Review | undefined {
+  const raw = extractJson(text, value => typeof value.issue === 'string')
+  if (!raw) return undefined
+  return { issue: str(raw.issue, 300), confidence: levelOf(raw.confidence, 'low') }
+}
+
 /** The triage model's JSON answer, normalized; undefined when it is unreadable. */
 export function parseTriage(text: string): Triage | undefined {
   const raw = extractJson(text, value => typeof value.worth === 'boolean')
