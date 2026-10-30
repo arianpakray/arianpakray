@@ -2400,6 +2400,21 @@ describe('0.4.2: what the tester writes is data, and a run is bounded by what it
     expect(status).toContain('$0.37 and')
   })
 
+  test('/stress help lists every command, the ones with a second spelling included', { timeoutMs: 30_000 }, async ($, on) => {
+    mock.clock(on, { now: 1_700_000_000_000 })
+    world(on)
+    await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+    const help = (await $.command.run(stress('help') as never)).text ?? ''
+    const lines = help.split('\n')
+    for (const verb of ['now', 'run', 'start', 'show', 'pane', 'status', 'pause', 'resume', 'stop', 'apply', 'dismiss', 'try', 'discover', 'forget', 'help']) {
+      expect([verb, new RegExp(`(^|[^a-z])${verb}([^a-z]|$)`).test(help)]).toEqual([verb, true])
+    }
+    // bare apply and named apply are two lines, as are dismiss and dismiss all
+    expect(lines.filter(line => line.startsWith('/stress apply'))).toHaveLength(2)
+    expect(lines.filter(line => line.startsWith('/stress dismiss'))).toHaveLength(2)
+    expect(help).toContain('maxDollarsPerSession')
+  })
+
   describe('maxDollarsPerSession', () => {
     // a $0.50 test against a $1 cap: the first starts, and its $0.90 leaves no room for another
     const options = { maxDollarsPerSession: 1, maxDollarsPerRun: 0.5 }
