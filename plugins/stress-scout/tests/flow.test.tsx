@@ -382,7 +382,7 @@ test('a risky edit is triaged, tested in a snapshot by a locked-down tester, and
   expect(w.suggestions.at(-1)).toBe('Apply stress-scout fix #1: evict before the await')
   const patchFile = [...w.writes.keys()].find(path => /[\\/]fix\.patch$/.test(path))
   expect(w.writes.get(patchFile ?? '')).toContain('+new')
-  expect(w.statuses.at(-1)).toMatch(/watching · 1\/8 runs/)
+  expect(w.statuses.at(-1)).toMatch(/watching · 1\/30 runs/)
   const status = await $.command.run(stress('status') as never)
   expect(status.text).toContain('$0.42')
 
@@ -514,7 +514,7 @@ test('a session with no surface attached does not try to place the pane', { time
   const shown = await $.command.run(stress('show') as never)
   expect(w.opened).toEqual([])
   expect(shown.text).toContain('No window is attached')
-  expect(shown.text).toContain('automatic runs 0/8')
+  expect(shown.text).toContain('automatic runs 0/30')
 })
 
 test('/stress start runs a test, as /stress run does', { timeoutMs: 30_000 }, async ($, on) => {
@@ -1185,7 +1185,7 @@ for (const surface of ['terminal', 'desktop'] as const) {
     await $.session.start({ cwd: ROOT, surface, isInteractive: true })
     await findOne($, clock, 'the cache')
     const ui = await $.ui.mount({ plugin: 'stress-scout', surface, component: 'AbovePrompt', props: BAND })
-    expect(await ui.find({ text: /\$0\.42 · \$1\.58 left of \$2 per run · 0\/8 runs/ })).toBeDefined()
+    expect(await ui.find({ text: /\$0\.42 · \$1\.58 left of \$2 per run · 0\/30 runs/ })).toBeDefined()
     await ui.unmount()
   })
 
@@ -1275,6 +1275,33 @@ test('the status line says when the rate-limit threshold has paused automatic ru
   await clock.advance(10 * 60_000)
   await clock.settle()
   expect(w.statuses.at(-1)).not.toMatch(/paused/)
+})
+
+test('the session dollar cap holds automatic runs, and a manual run says it is over budget', { timeoutMs: 30_000, options: { maxDollarsPerSession: 0.3 } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  // the first run costs $0.42, past the $0.30 cap
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+
+  await toolCall($, { tool: 'Write', file_path: `${ROOT}/src/queue.ts`, content: 'x' })
+  w.tree = TREE_C
+  await clock.advance(10 * 60_000)
+  await clock.settle()
+  expect(w.triagePrompts).toHaveLength(1)
+  expect(w.spawned).toHaveLength(1)
+  const status = (await $.command.run(stress('status') as never)).text
+  expect(status).toContain('session budget of $0.30 reached; automatic work resumes next session')
+
+  // a run the person asks for still goes ahead
+  const manual = await $.command.run(stress('the retry loop in api/client.ts') as never)
+  expect(manual.text).toContain('over the session budget of $0.30')
+  await clock.settle()
+  expect(w.spawned).toHaveLength(2)
 })
 
 /** One edit that moves the tree to `tree`, then the quiet period: whatever it triaged has run. */
@@ -1473,7 +1500,7 @@ describe('improvement scout', () => {
     expect(status.text).toContain('idea #1 (S) Show the eviction count in the cache stats [tried]')
     expect(w.toasts.at(-1)).toMatch(/^stress-scout tried idea #1 \(#2 held\)/)
     // it counted as a run
-    expect(w.statuses.at(-1)).toMatch(/watching · 1\/8 runs/)
+    expect(w.statuses.at(-1)).toMatch(/watching · 1\/30 runs/)
     const pane = await paneOf($)
     expect(await pane.find({ text: /src\/cache.ts:LruCache.set · concurrency · idea #1/ })).toBeDefined()
     await pane.unmount()
@@ -1740,7 +1767,7 @@ describe('discovery scout', () => {
     expect(w.triagePrompts).toHaveLength(0)
     expect(ledgerFile(w)).toContain('pre-registered: the hypotheses file was written before the first experiment')
     // it did not count as an automatic run
-    expect(w.statuses.at(-1)).toMatch(/watching · 0\/8 runs/)
+    expect(w.statuses.at(-1)).toMatch(/watching · 0\/30 runs/)
   })
 
   const unregistered = [

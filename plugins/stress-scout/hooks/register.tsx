@@ -139,6 +139,7 @@ type Config = {
   isDiscoveringWhenIdle: boolean
   maxDollarsPerDiscovery: number
   maxDiscoveries: number
+  maxDollarsPerSession: number
 }
 
 type Ctx = {
@@ -164,8 +165,8 @@ export function configOf(options: PluginOptions): Config {
   return {
     triageModel: typeof options.triageModel === 'string' ? options.triageModel : 'haiku',
     testerModel: typeof options.testerModel === 'string' ? options.testerModel : 'sonnet',
-    maxRuns: numberOf(options.maxRunsPerSession, 8, 0, 200),
-    maxSweeps: numberOf(options.maxSweepsPerSession, 3, 0, 200),
+    maxRuns: numberOf(options.maxRunsPerSession, 30, 0, 200),
+    maxSweeps: numberOf(options.maxSweepsPerSession, 8, 0, 200),
     minGapMs: numberOf(options.minMinutesBetweenRuns, 3, 0, 240) * 60_000,
     quietMs: numberOf(options.quietSeconds, 45, 1, 3600) * 1000,
     maxWaitMs: numberOf(options.maxWaitSeconds, 240, 10, 7200) * 1000,
@@ -180,11 +181,12 @@ export function configOf(options: PluginOptions): Config {
     testerTimeoutMs: numberOf(options.testerTimeoutMinutes, 20, 2, 120) * 60_000,
     isOffline: options.testerOffline !== false,
     isSuggesting: options.suggestImprovements !== false,
-    maxIdeas: numberOf(options.maxIdeasPerSession, 5, 0, 100),
+    maxIdeas: numberOf(options.maxIdeasPerSession, 10, 0, 100),
     isReadingSources: options.discoverSources !== false,
     isDiscoveringWhenIdle: options.discoverWhenIdle !== false,
     maxDollarsPerDiscovery: numberOf(options.maxDollarsPerDiscovery, 5, 0.05, 100),
     maxDiscoveries: numberOf(options.maxDiscoveriesPerSession, 2, 0, 50),
+    maxDollarsPerSession: numberOf(options.maxDollarsPerSession, 15, 0, 10_000),
   }
 }
 
@@ -464,6 +466,14 @@ const WINDOW_BRIEFS: Readonly<Record<string, string>> = {
   seven_day: 'weekly usage',
   spend_limit: 'spend limit',
 }
+
+/** The session's dollar cap has been reached (0 means no cap). */
+async function isOverBudget($: $): Promise<boolean> {
+  const cap = live.config.maxDollarsPerSession
+  return cap > 0 && (await read($, dollarsAtom)) >= cap
+}
+
+const budgetNote = (): string => `session budget of ${dollars(live.config.maxDollarsPerSession)} reached; automatic work resumes next session`
 
 /** The usage window at or past the pause point, by name and as the status line shows it: the 5-hour, the weekly, or a gateway's spend limit. */
 async function fullWindow($: $): Promise<{ name: string; brief: string } | undefined> {
@@ -1038,6 +1048,13 @@ async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): P
       await log($, `${trigger}: skipped, your ${full.name} is at or above ${config.rateLimitPct}%`)
       await update($, waitingAtom, () => `your ${full.name} is at or above ${config.rateLimitPct}%; automatic runs resume below it`)
       await update($, rateHoldAtom, () => full.brief)
+      await refreshStatus($)
+      return
+    }
+    if (await isOverBudget($)) {
+      // logged once per spell: the sweep heartbeat comes back every minute
+      if ((await read($, waitingAtom)) !== budgetNote()) await log($, `${trigger}: skipped, ${budgetNote()}`)
+      await update($, waitingAtom, () => budgetNote())
       await refreshStatus($)
       return
     }
@@ -1821,13 +1838,15 @@ async function forget($: $): Promise<string> {
 async function runNow($: $, focus?: string): Promise<string> {
   const run = await read($, runAtom)
   $.clock.after(0, () => void kick($, 'manual', focus))
+  // a manual run goes ahead past the cap: the person asked for it
+  const over = (await isOverBudget($)) ? ` (over the session budget of ${dollars(live.config.maxDollarsPerSession)}; it runs because you asked)` : ''
   if (run !== null) {
     const age = ago((await $.clock.now()) - run.startedAt)
-    return `Already testing ${run.target} (#${run.id}, ${age}); yours is queued after it.`
+    return `Already testing ${run.target} (#${run.id}, ${age}); yours is queued after it.${over}`
   }
   return focus !== undefined
-    ? `Stress-testing "${clip(focus, 120)}". Results land in /stress show.`
-    : 'Stress-testing the latest change (or the riskiest untested code if nothing changed). Results land in /stress show.'
+    ? `Stress-testing "${clip(focus, 120)}". Results land in /stress show.${over}`
+    : `Stress-testing the latest change (or the riskiest untested code if nothing changed). Results land in /stress show.${over}`
 }
 
 /** openPaneOnStart: a session with no surface yet (the app, the SDK) is tried again when its first turn starts. */

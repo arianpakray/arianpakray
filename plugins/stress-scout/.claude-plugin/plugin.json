@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
@@ -23,13 +23,13 @@
       "type": "number",
       "title": "Max automatic test runs per session",
       "description": "Hard cap on automatic deep runs; /stress still runs on demand.",
-      "default": 8
+      "default": 30
     },
     "maxSweepsPerSession": {
       "type": "number",
       "title": "Max idle sweeps per session",
       "description": "How many of the automatic runs may go to idle sweeps of untested code.",
-      "default": 3
+      "default": 8
     },
     "minMinutesBetweenRuns": {
       "type": "number",
@@ -67,6 +67,12 @@
       "description": "Minimum gap between two idle sweeps.",
       "default": 20
     },
+    "maxDollarsPerSession": {
+      "type": "number",
+      "title": "Max dollars per session",
+      "description": "Automatic work (runs, sweeps, idea tries, discoveries, edit reviews) stops at this total cost for the session; 0 means no cap. /stress still runs on demand.",
+      "default": 15
+    },
     "maxDollarsPerRun": {
       "type": "number",
       "title": "Max dollars per test run",
@@ -101,7 +107,7 @@
       "type": "number",
       "title": "Max ideas per session",
       "description": "Hard cap on suggested improvements shown in one session.",
-      "default": 5
+      "default": 10
     },
     "discoverSources": {
       "type": "boolean",

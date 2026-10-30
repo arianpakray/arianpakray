@@ -5,6 +5,7 @@ import { vetIdea } from '../hooks/lib/ideas'
 import { checkPreRegistration, fingerprintOf, normalizeQuestion, questionKey } from '../hooks/lib/discovery'
 import { parseDiscovery, parseReport, parseToolUses, parseTriage, type IdeaDraft } from '../hooks/lib/report'
 import { extractJson } from '../hooks/lib/util'
+import { configOf } from '../hooks/register'
 
 const REPORT = {
   target: 'src/cache.ts:LruCache.set',
@@ -207,4 +208,13 @@ test('pre-registration needs the file first, unchanged, holding every reported h
   expect(checkPreRegistration(hyps, { ...file, experimentsBefore: 1 }).isPreRegistered).toBe(false)
   expect(checkPreRegistration(hyps, { ...file, finalHash: 'y' }).isPreRegistered).toBe(false)
   expect(checkPreRegistration(hyps.slice(0, 1), file).note).toContain('fewer than two')
+})
+
+test('the defaults watch harder: more runs, sweeps and ideas, idle research on, a dollar cap for the session', () => {
+  const config = configOf({})
+  expect([config.maxRuns, config.maxSweeps, config.maxIdeas]).toEqual([30, 8, 10])
+  expect(config.maxDollarsPerSession).toBe(15)
+  expect(config.isDiscoveringWhenIdle).toBe(true)
+  expect(configOf({ maxDollarsPerSession: 0 }).maxDollarsPerSession).toBe(0)
+  expect(configOf({ discoverWhenIdle: false }).isDiscoveringWhenIdle).toBe(false)
 })
