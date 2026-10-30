@@ -11,24 +11,53 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { Finding, Phase, Run, Trigger, Verdict } from '../types'
+import type { Discovery, DiscoveryPlan, Finding, Idea, LedgerEntry, Phase, Run, Trigger, Verdict } from '../types'
 import { checkBash, checkRead, checkWrite, type Check, type Sandbox } from './lib/policy'
 import {
+  DISCOVERY_SYSTEM,
   HANDOFF,
   HANDOFF_DETAILS,
+  IDEA_SYSTEM,
   TESTER_SYSTEM,
   TRIAGE_SYSTEM,
   changeTriagePrompt,
+  discoveryTask,
   emptyMemory,
   handoffContext,
   handoffMessage,
   handoffPrompt,
+  PLUGIN_TYPES,
   sweepTriagePrompt,
   testerTask,
   type Memory,
 } from './lib/prompts'
+import {
+  HYPOTHESES_FILE,
+  answerText,
+  checkPreRegistration,
+  checkWeb,
+  sourcesOf,
+  fingerprintOf,
+  fromLedger,
+  ideaQuestion,
+  numbersLine,
+  questionKey,
+  renderLedger,
+  type Registered,
+} from './lib/discovery'
+import { vetIdea } from './lib/ideas'
 import { rankCandidates } from './lib/rank'
-import { isActionable, parseReport, parseStreamLine, parseTriage, type TesterResult, type Triage } from './lib/report'
+import {
+  isActionable,
+  parseDiscovery,
+  parseReport,
+  parseToolUses,
+  parseStreamLine,
+  parseTriage,
+  type IdeaDraft,
+  type TesterResult,
+  type Triage,
+} from './lib/report'
 import {
   blobsOf,
   changedPaths,
@@ -42,9 +71,11 @@ import {
   makeSnapshot,
   openShadow,
   patchOf,
+  projectHead,
   type Shadow,
+  worktreeBlobs,
 } from './lib/shadow'
-import { homeFolder, isWindowsPath, portable, removeTree, tempRoot, windowsCanonical } from './lib/platform'
+import { type Offline, homeFolder, isWindowsPath, offlineCommand, portable, probeOffline, removeTree, tempRoot, windowsCanonical } from './lib/platform'
 import { ago, basename, clip, clockTime, compactTokens, fnv, isInside, oneLine, slug, trimSlash } from './lib/util'
 
 type $ = EngineInterface
@@ -52,12 +83,22 @@ type $ = EngineInterface
 const PANE = 'stress-scout'
 const EDIT_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit'])
 const TESTER_TOOLS = 'Bash,Read,Write,Edit'
+const WEB_TOOLS = 'WebSearch,WebFetch'
 const KEEP_RUNS = 8
+const RERUN_TIMEOUT_MS = 120_000
+/** The statuses a finding's harness is rerun in: its fix may have landed, or may since have broken. */
+const RERUN_STATUSES = new Set<Finding['status']>(['applied', 'fixed', 'regressed'])
 const NO_CHANGE = 'no change since the last scan'
+/** Bump when TRIAGE_SYSTEM or the prompt shape changes, so verdicts cached under the old wording are not reused. */
+const TRIAGE_VERSION = 1
+const TRIAGE_CACHE_KEEP = 200
+const TRIAGE_CACHE_MAX_AGE_MS = 7 * 24 * 3_600_000
 
 const phaseAtom = atom({ plugin: 'stress-scout', key: 'phase' } as const, { kind: 'idle', detail: '', since: 0 })
 const findingsAtom = atom({ plugin: 'stress-scout', key: 'findings' } as const, [])
-const activityAtom = atom({ plugin: 'stress-scout', key: 'activity' } as const, [])
+const ideasAtom = atom({ plugin: 'stress-scout', key: 'ideas' } as const, [])
+const ideasUsedAtom = atom({ plugin: 'stress-scout', key: 'ideasUsed' } as const, 0)
+const activityAtom =atom({ plugin: 'stress-scout', key: 'activity' } as const, [])
 const runAtom = atom({ plugin: 'stress-scout', key: 'run' } as const, null)
 const runsUsedAtom = atom({ plugin: 'stress-scout', key: 'runsUsed' } as const, 0)
 const sweepsUsedAtom = atom({ plugin: 'stress-scout', key: 'sweepsUsed' } as const, 0)
@@ -67,6 +108,12 @@ const pausedAtom = atom({ plugin: 'stress-scout', key: 'paused' } as const, fals
 const seenAtom = atom({ plugin: 'stress-scout', key: 'seenId' } as const, 0)
 const openAtom = atom({ plugin: 'stress-scout', key: 'openId' } as const, 0)
 const suggestedAtom = atom({ plugin: 'stress-scout', key: 'suggestedId' } as const, 0)
+const waitingAtom = atom({ plugin: 'stress-scout', key: 'waiting' } as const, '')
+/** Set while the rate-limit threshold holds automatic runs: the window and its use, for the status line. */
+const rateHoldAtom = atom({ plugin: 'stress-scout', key: 'rateHold' } as const, '')
+const discoveriesAtom = atom({ plugin: 'stress-scout', key: 'discoveries' } as const, [])
+const discoveryPlanAtom = atom({ plugin: 'stress-scout', key: 'discoveryPlan' } as const, null)
+const discoveriesUsedAtom = atom({ plugin: 'stress-scout', key: 'discoveriesUsed' } as const, 0)
 
 type Config = {
   triageModel: string
@@ -79,10 +126,19 @@ type Config = {
   idleMs: number
   isSweeping: boolean
   sweepGapMs: number
+  isAutoApplying: boolean
+  isOpeningPane: boolean
   maxDollarsPerRun: number
   claudePath: string
   rateLimitPct: number
   testerTimeoutMs: number
+  isOffline: boolean
+  isSuggesting: boolean
+  maxIdeas: number
+  isReadingSources: boolean
+  isDiscoveringWhenIdle: boolean
+  maxDollarsPerDiscovery: number
+  maxDiscoveries: number
 }
 
 type Ctx = {
@@ -99,7 +155,7 @@ type Ctx = {
 
 type Plan = { plan: Triage; tokens: number; base: string }
 
-type Outcome = { answer: string; cost: number; tokens: number; failure: string; steps: number }
+type Outcome = { answer: string; cost: number; tokens: number; failure: string; steps: number; registered?: Registered }
 
 const numberOf = (value: unknown, fallback: number, min: number, max: number): number =>
   typeof value === 'number' && Number.isFinite(value) ? Math.min(max, Math.max(min, value)) : fallback
@@ -116,10 +172,19 @@ export function configOf(options: PluginOptions): Config {
     idleMs: numberOf(options.idleSeconds, 30, 1, 3600) * 1000,
     isSweeping: options.sweepWhenIdle !== false,
     sweepGapMs: numberOf(options.sweepMinutes, 20, 1, 1440) * 60_000,
+    isAutoApplying: options.autoApplyVerifiedFixes !== false,
+    isOpeningPane: options.openPaneOnStart !== false,
     maxDollarsPerRun: numberOf(options.maxDollarsPerRun, 2, 0.05, 100),
     claudePath: typeof options.claudePath === 'string' ? options.claudePath.trim() : '',
     rateLimitPct: numberOf(options.pauseAtRateLimitPercent, 80, 1, 101),
     testerTimeoutMs: numberOf(options.testerTimeoutMinutes, 20, 2, 120) * 60_000,
+    isOffline: options.testerOffline !== false,
+    isSuggesting: options.suggestImprovements !== false,
+    maxIdeas: numberOf(options.maxIdeasPerSession, 5, 0, 100),
+    isReadingSources: options.discoverSources !== false,
+    isDiscoveringWhenIdle: options.discoverWhenIdle === true,
+    maxDollarsPerDiscovery: numberOf(options.maxDollarsPerDiscovery, 5, 0.05, 100),
+    maxDiscoveries: numberOf(options.maxDiscoveriesPerSession, 2, 0, 50),
   }
 }
 
@@ -127,6 +192,14 @@ export function configOf(options: PluginOptions): Config {
 const live = {
   role: 'scout' as 'scout' | 'tester',
   box: undefined as Sandbox | undefined,
+  /** Tester role: how its Bash commands lose the network, as the scout found it. */
+  offline: '' as Offline,
+  /** the offline wrappings of commands the guard passed: the check that runs on the wrapped call lets exactly these through */
+  wrapped: new Set<string>(),
+  /** inside a discovery tester that may use the web tools */
+  hasWeb: false,
+  /** what this discovery tester's searches returned, and how many it made */
+  web: { sources: new Set<string>(), queries: new Set<string>() },
   config: configOf({}),
   ctx: undefined as Ctx | undefined,
   ctxError: '',
@@ -135,16 +208,31 @@ const live = {
   idleTimer: undefined as Timer | undefined,
   retryTimer: undefined as Timer | undefined,
   watchTimer: undefined as Timer | undefined,
+  autoTimer: undefined as Timer | undefined,
   stopTester: undefined as (() => void) | undefined,
+  /** openPaneOnStart has placed the pane once this load; closing it afterwards is the person's call. */
+  isPaneShown: false,
   firstDirtyAt: 0,
   lastActivityAt: 0,
   isMainBusy: false,
   isCycling: false,
   pending: undefined as Trigger | undefined,
   pendingFocus: undefined as string | undefined,
+  /** ideas the idle pick has already asked about this session */
+  researched: new Set<number>(),
+  /** the suggestion a queued /stress try is for */
+  pendingIdea: undefined as number | undefined,
+  /** files changed in scans this session, newest last: the only ones an idea may touch */
+  recentEdits: [] as string[],
   lastRunStartedAt: 0,
   seenTree: '',
   seenTreeAt: 0,
+  /** Findings whose files changed while their harness was rerunning: they rerun once the turn ends. */
+  staleReruns: new Set<number>(),
+  /** Findings whose harness is rerunning now. */
+  rerunning: new Set<number>(),
+  /** Findings whose harness has been rerun since they were handed over. */
+  rerun: new Set<number>(),
 }
 
 const PRIORITY: Record<Trigger, number> = { manual: 4, change: 3, idle: 2, sweep: 1 }
@@ -160,6 +248,12 @@ const tokensOf = (usage: ModelUsage | undefined): number =>
     : usage.input_tokens + usage.output_tokens + usage.cache_creation_input_tokens + usage.cache_read_input_tokens
 
 const dollars = (n: number): string => `$${n < 10 ? n.toFixed(2) : n.toFixed(0)}`
+
+/** The file part of a finding's target (`src/cache.ts:LruCache.set`); a focus phrase stays whole. */
+const fileOf = (target: string): string => target.split(':')[0]?.trim() || target
+
+/** Where "dismiss all <kind> in <file>" is remembered: by file and kind, not by the run's memoryKey. */
+const fileDismissalKey = (file: string, kind: string): string => `file:${file}|${kind}`
 
 const isMemory = (value: unknown): value is Memory =>
   value !== null && typeof value === 'object' && (value as { v?: unknown }).v === 1
@@ -184,6 +278,10 @@ const isSnapshotPath = (path: string): boolean => /[\\/]stress-scout[\\/][^\\/]+
 /** An absolute path, POSIX or Windows (`C:\` or `C:/`; a `\\` network path counts too). */
 const isAbsolutePath = (path: string): boolean => path.startsWith('/') || isWindowsPath(path)
 
+/** A file inside the project, as the finding names it: relative, never up a level, never the harness. */
+const isProjectPath = (path: string): boolean =>
+  path !== '' && !isAbsolutePath(path) && !/(^|[\\/])\.\.([\\/]|$)/.test(path) && !path.startsWith('.stress-scout')
+
 /** Whether `path` is `dir` or inside it, comparing as the platform does (Windows ignores case and the separator). */
 const isWithin = (path: string, dir: string, isWindows: boolean): boolean =>
   isWindows ? isInside(windowsCanonical(path), windowsCanonical(dir)) : isInside(path, dir)
@@ -196,7 +294,12 @@ async function log($: $, text: string): Promise<void> {
 }
 
 async function refreshStatus($: $): Promise<void> {
-  const [phase, paused, runsUsed] = await Promise.all([read($, phaseAtom), read($, pausedAtom), read($, runsUsedAtom)])
+  const [phase, paused, runsUsed, rateHold] = await Promise.all([
+    read($, phaseAtom),
+    read($, pausedAtom),
+    read($, runsUsedAtom),
+    read($, rateHoldAtom),
+  ])
   const { maxRuns } = live.config
   const text =
     phase.kind === 'off'
@@ -205,7 +308,9 @@ async function refreshStatus($: $): Promise<void> {
         ? `stress-scout ▶ testing ${clip(phase.detail, 60)}`
         : paused
           ? 'stress-scout paused (/stress resume)'
-          : phase.kind === 'triage'
+          : rateHold !== ''
+            ? `stress-scout paused: ${rateHold}`
+            : phase.kind === 'triage'
             ? 'stress-scout … triaging'
             : runsUsed >= maxRuns
               ? `stress-scout ✓ watching · run cap ${runsUsed}/${maxRuns} reached (/stress still works)`
@@ -267,6 +372,7 @@ async function ensureCtx($: $): Promise<Ctx | undefined> {
       scratchSpellings: unique([scratch, trimSlash(given)]),
     }
     live.ctxError = ''
+    await syncLedger($, live.ctx).catch(() => undefined)
     return live.ctx
   } catch (error) {
     live.ctxError = `setup failed: ${messageOf(error)}`
@@ -276,7 +382,16 @@ async function ensureCtx($: $): Promise<Ctx | undefined> {
 
 async function loadMemory($: $, c: Ctx): Promise<Memory> {
   const raw = await $.store.get(memoryKeyOf(c))
-  return isMemory(raw) ? raw : emptyMemory()
+  return isMemory(raw) ? { ...emptyMemory(), ...raw } : emptyMemory()
+}
+
+const triageCacheKeyOf = (c: Ctx): string => `triage:${c.projectKey}`
+
+type TriageCache = Record<string, { at: number; plan: Triage }>
+
+async function loadTriageCache($: $, c: Ctx): Promise<TriageCache> {
+  const raw = await $.store.get(triageCacheKeyOf(c))
+  return raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? (raw as TriageCache) : {}
 }
 
 const newest = <T extends { at: number }>(record: Record<string, T>, n: number): Record<string, T> =>
@@ -300,6 +415,32 @@ async function saveMemory($: $, c: Ctx, memory: Memory): Promise<void> {
   for (const { key } of ages.sort((a, b) => a.at - b.at).slice(0, keys.length - 40)) await $.store.delete(key)
 }
 
+// ---- the discovery ledger: what this project has asked, answered or given up on ---------
+
+const ledgerKeyOf = (c: Ctx): string => `disc:${c.projectKey}`
+
+async function loadLedger($: $, c: Ctx): Promise<LedgerEntry[]> {
+  const raw = await $.store.get(ledgerKeyOf(c))
+  const entries = raw !== null && typeof raw === 'object' ? (raw as { entries?: unknown }).entries : undefined
+  return Array.isArray(entries) ? (entries as LedgerEntry[]) : []
+}
+
+async function syncLedger($: $, c: Ctx): Promise<void> {
+  const entries = await loadLedger($, c)
+  await update($, discoveriesAtom, () => entries.slice(0, 20))
+}
+
+async function saveLedger($: $, c: Ctx, entries: LedgerEntry[]): Promise<void> {
+  const kept = entries.slice(0, 100)
+  await $.store.set(ledgerKeyOf(c), { v: 1, entries: kept })
+  await update($, discoveriesAtom, () => kept.slice(0, 20))
+}
+
+/** The sha of every file in a tree: what a ledger fingerprint is made of. */
+async function shasOf($: $, c: Ctx, tree: string): Promise<Map<string, string>> {
+  return new Map((await listTree($, c.shadow, tree)).map(file => [file.path, file.sha] as const))
+}
+
 async function recentIntent($: $): Promise<string[]> {
   const messages: unknown = await $.session.messages().catch(() => [])
   if (!Array.isArray(messages)) return []
@@ -317,12 +458,24 @@ const WINDOW_NAMES: Readonly<Record<string, string>> = {
   spend_limit: 'spend limit',
 }
 
-/** The usage window at or past the pause point, by name: the 5-hour, the weekly, or a gateway's spend limit. */
-async function fullWindow($: $): Promise<string | undefined> {
+/** The same windows for the status line. */
+const WINDOW_BRIEFS: Readonly<Record<string, string>> = {
+  five_hour: '5h usage',
+  seven_day: 'weekly usage',
+  spend_limit: 'spend limit',
+}
+
+/** The usage window at or past the pause point, by name and as the status line shows it: the 5-hour, the weekly, or a gateway's spend limit. */
+async function fullWindow($: $): Promise<{ name: string; brief: string } | undefined> {
   try {
     const { rateLimits } = await $.session.usage()
     const full = rateLimits.find(limit => limit.percentUsed >= live.config.rateLimitPct)
-    return full === undefined ? undefined : (WINDOW_NAMES[full.kind] ?? full.kind.replace(/_/g, ' '))
+    if (full === undefined) return undefined
+    const spelled = full.kind.replace(/_/g, ' ')
+    return {
+      name: WINDOW_NAMES[full.kind] ?? spelled,
+      brief: `${WINDOW_BRIEFS[full.kind] ?? spelled} ${Math.round(full.percentUsed)}%`,
+    }
   } catch {
     return undefined
   }
@@ -392,7 +545,7 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
     case 'Bash':
       if (input.run_in_background === true) return refuse('run commands in the foreground, wrapped in timeout')
       if (input.dangerouslyDisableSandbox === true) return refuse('the sandbox stays on')
-      return checkBash(text('command'), box)
+      return live.wrapped.has(text('command')) ? { isAllowed: true } : checkBash(text('command'), box)
     case 'Read': {
       const path = text('file_path')
       const real = isAbsolutePath(path) ? (await $.fs.stat(path, { resolve: true }).catch(() => undefined))?.realPath : undefined
@@ -408,6 +561,9 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
     }
     case 'NotebookEdit':
       return checkWrite(await placed($, text('notebook_path')), text('new_source'), box)
+    case 'WebSearch':
+    case 'WebFetch':
+      return live.hasWeb ? checkWeb(tool, input, live.web) : refuse(`${tool} is only for a discovery run with fresh sources on`)
     default:
       return refuse(`${tool} is not part of the tester's toolkit`)
   }
@@ -415,12 +571,27 @@ async function testerCheck($: $, tool: string, input: Record<string, unknown>): 
 
 // ---- the cycle: fingerprint, triage, test (scout role) -------------------------------
 
-async function triage($: $, prompt: string): Promise<{ plan?: Triage; tokens: number; error?: string }> {
+/**
+ * Triage a change, or reuse the verdict for the same code from any session: `basis` is
+ * the code the model is judging (the diff, or the sweep's candidate rows), not the
+ * surrounding prompt, which changes with the conversation.
+ */
+async function triage(
+  $: $,
+  c: Ctx,
+  prompt: string,
+  basis: string,
+  isAskingIdea = false,
+): Promise<{ plan?: Triage; tokens: number; error?: string }> {
+  const now = await $.clock.now()
+  const key = fnv(`${TRIAGE_VERSION}|${live.config.triageModel}|${isAskingIdea ? 'idea' : ''}|${basis.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim()}`)
+  const hit = (await loadTriageCache($, c))[key]
+  if (hit !== undefined && now - hit.at < TRIAGE_CACHE_MAX_AGE_MS) return { plan: { ...hit.plan, files: [...hit.plan.files] }, tokens: 0 }
   const reply = await $.model.complete({
     model: live.config.triageModel,
-    system: TRIAGE_SYSTEM,
+    system: isAskingIdea ? `${TRIAGE_SYSTEM}\n\n${IDEA_SYSTEM}` : TRIAGE_SYSTEM,
     prompt,
-    maxTokens: 700,
+    maxTokens: isAskingIdea ? 900 : 700,
     timeoutMs: 90_000,
   })
   const tokens = tokensOf(reply.usage)
@@ -429,7 +600,12 @@ async function triage($: $, prompt: string): Promise<{ plan?: Triage; tokens: nu
     return { tokens, error: why }
   }
   const plan = parseTriage(reply.text)
-  return plan === undefined ? { tokens, error: 'triage reply was unreadable' } : { plan, tokens }
+  if (plan === undefined) return { tokens, error: 'triage reply was unreadable' }
+  // re-read: another session may have cached a verdict while the model was answering
+  const cache = { ...(await loadTriageCache($, c)), [key]: { at: now, plan } }
+  const fresh = Object.fromEntries(Object.entries(cache).filter(([, entry]) => now - entry.at < TRIAGE_CACHE_MAX_AGE_MS))
+  await $.store.set(triageCacheKeyOf(c), newest(fresh, TRIAGE_CACHE_KEEP))
+  return { plan, tokens }
 }
 
 /** The project's tree as it stands, through a shadow that is rebuilt when damaged. */
@@ -477,7 +653,9 @@ async function choose(
     if (paths.length > 0) {
       const stat = await diffStat($, c.shadow, base, tree)
       const diff = await diffText($, c.shadow, base, tree, [], 24_000)
-      const result = await triage($, changeTriagePrompt({ intent, memory, now, currentHashes, stat, diff }))
+      live.recentEdits = unique([...live.recentEdits, ...paths]).slice(-40)
+      const edits = config.isSuggesting ? live.recentEdits : undefined
+      const result = await triage($, c, changeTriagePrompt({ intent, memory, now, currentHashes, stat, diff, edits }), `${stat}\n${diff}`, edits !== undefined)
       if (result.plan === undefined) return { kind: 'change', note: result.error ?? 'triage failed' }
       memory.lastTree = tree
       return { chosen: { plan: result.plan, tokens: result.tokens, base }, kind: 'change', note: '' }
@@ -491,7 +669,8 @@ async function choose(
     ((trigger === 'idle' || trigger === 'sweep') &&
       config.isSweeping &&
       sweepsUsed < config.maxSweeps &&
-      now - memory.lastSweepAt >= config.sweepGapMs)
+      now - memory.lastSweepAt >= config.sweepGapMs &&
+      now - memory.lastRunEndedAt >= config.sweepGapMs)
   if (!isSweepDue) return { kind: trigger, note: NO_CHANGE }
 
   memory.lastSweepAt = now
@@ -505,7 +684,12 @@ async function choose(
   const isTestedNow = (path: string, sha: string): boolean => testedFiles.get(path) === fnv(`${path}:${sha}`)
   const candidates = rankCandidates(files, history, isTestedNow)
   if (candidates.length === 0) return { kind: 'sweep', note: 'nothing untested left to sweep' }
-  const result = await triage($, sweepTriagePrompt({ intent, memory, now, currentHashes, candidates }))
+  const result = await triage(
+    $,
+    c,
+    sweepTriagePrompt({ intent, memory, now, currentHashes, candidates }),
+    JSON.stringify(candidates),
+  )
   if (result.plan === undefined) return { kind: 'sweep', note: result.error ?? 'triage failed' }
   return { chosen: { plan: result.plan, tokens: result.tokens, base: '' }, kind: 'sweep', note: '' }
 }
@@ -521,7 +705,9 @@ const tempEnv = (dir: string, isWindows: boolean): Record<string, string> =>
 
 /** The headless tester's command line: few tools, no MCP, no skills, a budget, the guard loaded. */
 function testerArgv($: $, exec: string, run: Run): string[] {
-  const { testerModel, maxDollarsPerRun } = live.config
+  const { testerModel, isReadingSources } = live.config
+  const isDiscovery = run.question !== ''
+  const maxDollars = isDiscovery ? live.config.maxDollarsPerDiscovery : live.config.maxDollarsPerRun
   return [
     exec,
     '-p',
@@ -530,30 +716,33 @@ function testerArgv($: $, exec: string, run: Run): string[] {
     ...(testerModel === 'inherit' ? [] : ['--model', testerModel]),
     ...(testerModel === 'haiku' ? [] : ['--effort', 'medium']),
     '--permission-mode', 'dontAsk',
-    '--tools', TESTER_TOOLS,
+    '--tools', isDiscovery && isReadingSources ? `${TESTER_TOOLS},${WEB_TOOLS}` : TESTER_TOOLS,
     '--strict-mcp-config',
     '--disable-slash-commands',
     '--no-session-persistence',
     '--setting-sources', 'user',
-    '--max-turns', '60',
-    '--max-budget-usd', String(maxDollarsPerRun),
+    '--max-turns', isDiscovery ? '90' : '60',
+    '--max-budget-usd', String(maxDollars),
     '--add-dir', run.runDir,
     '--plugin-dir', $.plugin.root,
-    '--append-system-prompt', TESTER_SYSTEM,
+    '--append-system-prompt', isDiscovery ? DISCOVERY_SYSTEM : TESTER_SYSTEM,
   ]
 }
 
 /** Runs the tester process to its end (or the deadline, or a Stop), then files what it found. */
-async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<void> {
+async function superviseTester($: $, c: Ctx, run: Run, prompt: string, offline: Offline): Promise<void> {
   const { config } = live
   const exec = config.claudePath !== '' ? config.claudePath : ((await $.env.get('CLAUDE_CODE_EXECPATH')) ?? '') || 'claude'
   const box = sandboxOf(c, run)
   const isPlan = await isOnPlan($)
+  const isDiscovery = run.question !== ''
   const env = {
     STRESS_SCOUT_ROLE: 'tester',
     STRESS_SCOUT_ROOTS: JSON.stringify(box.roots),
     STRESS_SCOUT_RUN_DIRS: JSON.stringify(box.runDirs),
     STRESS_SCOUT_HOME: box.home,
+    STRESS_SCOUT_OFFLINE: offline,
+    ...(isDiscovery && config.isReadingSources ? { STRESS_SCOUT_WEB: '1' } : {}),
     // Windows programs read TEMP and TMP; Git Bash and the rest read TMPDIR
     ...tempEnv(c.isWindows ? portable(`${run.runDir}/tmp`) : `${run.runDir}/tmp`, c.isWindows),
     // claude -p bills an ANTHROPIC_API_KEY it finds in the environment without asking, where a session
@@ -565,6 +754,11 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
   let stderrTail = ''
   let failure = ''
   let isStopped = false
+  // a discovery run's hypotheses file: what the scout saw of it, and how many experiments had begun when it appeared
+  const hypothesesPath = `${run.snapshot}/${HYPOTHESES_FILE}`
+  let seen: Omit<Registered, 'finalHash'> | undefined
+  let experiments = 0
+  let stopReason = ''
   let endEarly: (reason: 'deadline') => void = () => undefined
   const early = new Promise<'deadline'>(resolve => {
     endEarly = resolve
@@ -578,6 +772,16 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
     const stream = $.process.spawn({ argv: testerArgv($, exec, run), cwd: run.snapshot, env, input: prompt })
     let pendingText = ''
     const take = async (line: string): Promise<void> => {
+      if (isDiscovery) {
+        if (seen === undefined && (await $.fs.exists(hypothesesPath).catch(() => false))) {
+          const text = await $.fs.read(hypothesesPath).catch(() => '')
+          seen = { hash: fnv(text), at: await $.clock.now(), text: clip(text, 20_000), experimentsBefore: experiments }
+          await log($, `#${run.id}: hypotheses registered (${seen.hash}) after ${experiments} experiments`)
+        }
+        for (const use of parseToolUses(line)) {
+          if (use.name === 'Bash' || (EDIT_TOOLS.has(use.name) && !use.target.endsWith(HYPOTHESES_FILE))) experiments += 1
+        }
+      }
       const event = parseStreamLine(line)
       if (event.result !== undefined) result = event.result
       if (event.toolUses === 0) return
@@ -585,12 +789,18 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
       steps += event.toolUses
       if (Math.floor(steps / 5) > Math.floor(before / 5)) {
         await setPhase($, 'test', `${clip(run.target, 50)} (${run.kind}) · step ${steps}`)
+        // a discovery spends the longest: it also stops where the automatic runs pause
+        const full = isDiscovery ? await fullWindow($) : undefined
+        if (full !== undefined) {
+          stopReason = `stopped: your ${full.name} reached ${config.rateLimitPct}%`
+          endEarly('deadline')
+        }
       }
     }
     for (;;) {
       const step = await Promise.race([stream.next(), early])
       if (step === 'deadline') {
-        failure = isStopped ? 'stopped before it finished' : `timed out after ${ago(config.testerTimeoutMs)}`
+        failure = stopReason || (isStopped ? 'stopped before it finished' : `timed out after ${ago(config.testerTimeoutMs)}`)
         void stream.return({ code: null, signal: 'SIGTERM' }).catch(() => undefined)
         break
       }
@@ -622,12 +832,17 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string): Promise<
   if (result?.isError === true && failure === '') {
     failure =
       result.subtype === 'error_max_budget_usd'
-        ? `stopped at the ${dollars(config.maxDollarsPerRun)} budget for one run`
+        ? `stopped at the ${dollars(isDiscovery ? config.maxDollarsPerDiscovery : config.maxDollarsPerRun)} budget for one ${isDiscovery ? 'discovery' : 'run'}`
         : result.subtype === 'error_max_turns'
           ? 'ran out of turns before finishing'
           : `ended with ${result.subtype || 'an error'}`
   }
-  await finishRun($, run, { answer: result?.text ?? '', cost: result?.cost ?? 0, tokens: result?.tokens ?? 0, failure, steps })
+  let registered: Registered | undefined
+  if (seen !== undefined) {
+    const last = await $.fs.read(hypothesesPath).catch(() => seen?.text ?? '')
+    registered = { ...seen, finalHash: fnv(last) }
+  }
+  await finishRun($, run, { answer: result?.text ?? '', cost: result?.cost ?? 0, tokens: result?.tokens ?? 0, failure, steps, registered })
 }
 
 type StartArgs = {
@@ -640,48 +855,109 @@ type StartArgs = {
   diff: string
   memoryKey: string
   hash: string
+  /** the suggestion this run builds (`/stress try N`), or the one a discovery researches */
+  idea?: Idea
+  /** set for a discovery run: the question it researches */
+  question?: string
+}
+
+/** Whether the engine's event types are in the snapshot; copied from the project when only it has them. */
+async function layTypes($: $, c: Ctx, snapshot: string): Promise<boolean> {
+  if (await $.fs.exists(`${snapshot}/${PLUGIN_TYPES}`)) return true
+  if (!(await $.fs.exists(`${c.root}/${PLUGIN_TYPES}`))) return false
+  try {
+    await $.fs.write(`${snapshot}/${PLUGIN_TYPES}`, await $.fs.read(`${c.root}/${PLUGIN_TYPES}`))
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
   const startedAt = await $.clock.now()
   const runDir = `${c.scratch}/runs/run-${String(args.id).padStart(4, '0')}-${startedAt}`
   const { snapshot, linked } = await makeSnapshot($, c.shadow, args.tree, runDir)
+  const { branch, head } = await projectHead($, c.root)
   const run: Run = {
     id: args.id,
     trigger: args.trigger,
     target: args.plan.target,
     kind: args.plan.kind,
+    files: args.plan.files,
     memoryKey: args.memoryKey,
     hash: args.hash,
     runDir,
     snapshot,
+    branch,
+    head,
     baseTree: args.tree,
     startedAt,
     tokens: args.tokens,
+    fromIdea: args.idea?.id ?? 0,
+    question: args.question ?? '',
   }
   await update($, runAtom, () => run)
   await update($, tokensAtom, n => n + args.tokens)
-  if (args.trigger !== 'manual') {
+  // a tried idea counts toward the cap like an automatic run, though the person asked for it
+  if (args.question === undefined && (args.trigger !== 'manual' || args.idea !== undefined)) {
     await update($, runsUsedAtom, n => n + 1)
     if (args.trigger === 'sweep') await update($, sweepsUsedAtom, n => n + 1)
   }
   live.lastRunStartedAt = startedAt
   await setPhase($, 'test', `${clip(args.plan.target, 50)} (${args.plan.kind})`)
   await log($, `#${args.id} ${args.trigger}: testing ${args.plan.target} (${args.plan.kind}): ${args.plan.why}`)
-  const prompt = testerTask({
-    id: args.id,
-    trigger: args.trigger,
-    plan: args.plan,
-    intent: args.intent,
-    diff: args.diff,
+  const isPlugin = (await $.fs.exists(`${c.root}/.claude-plugin/plugin.json`)) && (await $.fs.exists(`${c.root}/hooks`))
+  const hasTypes = isPlugin && (await layTypes($, c, snapshot))
+  const paths = {
     snapshot: c.isWindows ? portable(snapshot) : snapshot,
     runDir: c.isWindows ? portable(runDir) : runDir,
     root: c.isWindows ? portable(c.root) : c.root,
     linkedDeps: linked,
     isWindows: c.isWindows,
-  })
-  void superviseTester($, c, run, prompt)
+  }
+  const prompt =
+    args.question !== undefined
+      ? discoveryTask({
+          ...paths,
+          id: args.id,
+          question: args.question,
+          files: args.plan.files,
+          intent: args.intent,
+          hasSources: live.config.isReadingSources,
+          idea: args.idea,
+        })
+      : testerTask({
+          ...paths,
+          id: args.id,
+          trigger: args.trigger,
+          plan: args.plan,
+          intent: args.intent,
+          diff: args.diff,
+          isPlugin,
+          hasTypes,
+          idea: args.idea,
+        })
+  // the claude process itself needs the API; only the commands it runs lose the network
+  const offline = live.config.isOffline ? await probeOffline($, c.isWindows).catch(() => '' as const) : ''
+  await log($, `#${args.id} network: ${offline === '' ? 'guard only' : `off (${offline})`}`)
+  void superviseTester($, c, run, prompt, offline)
 }
+
+/** The tester's brief for `/stress try N`: build the suggestion in the sandbox, targeting its files. */
+const ideaPlan = (idea: Idea): Plan => ({
+  plan: {
+    isWorth: true,
+    risk: 'high',
+    target: idea.title,
+    files: idea.files,
+    kind: 'edge',
+    why: idea.why,
+    attack: '',
+    skip: '',
+  },
+  tokens: 0,
+  base: '',
+})
 
 const manualPlan = (focus: string): Plan => ({
   plan: {
@@ -698,7 +974,60 @@ const manualPlan = (focus: string): Plan => ({
   base: '',
 })
 
-async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
+async function setIdeaStatus($: $, id: number, status: Idea['status'], from?: Idea['status']): Promise<void> {
+  await update($, ideasAtom, list => list.map(i => (i.id === id && (from === undefined || i.status === from) ? { ...i, status } : i)))
+}
+
+/** Files the triage model's idea when it clears the guardrails, the session cap and what was dismissed before. */
+async function offerIdea($: $, c: Ctx, tree: string, memory: Memory, draft: IdeaDraft | undefined): Promise<void> {
+  const { config } = live
+  if (!config.isSuggesting || draft === undefined || !vetIdea(draft, live.recentEdits).isOk) return
+  if ((await read($, ideasUsedAtom)) >= config.maxIdeas) return
+  await fileIdea($, c, tree, memory, draft)
+}
+
+/** Adds an idea that cleared its guardrails to the list, unless the same code already has it or it was dismissed. */
+async function fileIdea($: $, c: Ctx, tree: string, memory: Memory, draft: IdeaDraft): Promise<boolean> {
+  const files = unique(draft.files).sort()
+  const blobs = await blobsOf($, c.shadow, tree, files)
+  if (!files.every(file => blobs.has(file))) return false
+  const memoryKey = files.join(',')
+  const hash = fnv(files.map(file => `${file}:${blobs.get(file) ?? ''}`).join('|'))
+  if (memory.dismissed[`${memoryKey}|idea`]?.hash === hash) return false
+  if ((await read($, ideasAtom)).some(i => i.memoryKey === memoryKey && i.hash === hash)) return false
+  const idea: Idea = {
+    id: memory.nextId,
+    at: await $.clock.now(),
+    title: draft.title,
+    why: draft.why,
+    files,
+    size: draft.size === 'M' ? 'M' : 'S',
+    status: 'new',
+    memoryKey,
+    hash,
+  }
+  memory.nextId += 1
+  await update($, ideasAtom, list => [idea, ...list].slice(0, 12))
+  await update($, ideasUsedAtom, n => n + 1)
+  await log($, `idea #${idea.id} (${idea.size}): ${idea.title}`)
+  return true
+}
+
+async function tryIdea($: $, id: number): Promise<string> {
+  const idea = (await read($, ideasAtom)).find(i => i.id === id)
+  if (idea === undefined) return `No idea #${id}.`
+  if (idea.status === 'dismissed') return `Idea #${id} was dismissed.`
+  if (idea.status === 'trying') return `Idea #${id} is already being tried.`
+  await setIdeaStatus($, id, 'trying')
+  await update($, seenAtom, seen => Math.max(seen, id))
+  $.clock.after(0, () => void kick($, 'manual', idea.title, id))
+  const run = await read($, runAtom)
+  return run !== null
+    ? `Trying idea #${id} after the test of ${run.target} (#${run.id}).`
+    : `Trying idea #${id} in the sandbox. The result lands in /stress show.`
+}
+
+async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
   const { config } = live
   const isManual = trigger === 'manual'
   if (!isManual) {
@@ -706,7 +1035,10 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     if ((await read($, runsUsedAtom)) >= config.maxRuns) return
     const full = await fullWindow($)
     if (full !== undefined) {
-      await log($, `${trigger}: skipped, your ${full} is at or above ${config.rateLimitPct}%`)
+      await log($, `${trigger}: skipped, your ${full.name} is at or above ${config.rateLimitPct}%`)
+      await update($, waitingAtom, () => `your ${full.name} is at or above ${config.rateLimitPct}%; automatic runs resume below it`)
+      await update($, rateHoldAtom, () => full.brief)
+      await refreshStatus($)
       return
     }
     const now = await $.clock.now()
@@ -714,9 +1046,13 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
     if (live.lastRunStartedAt > 0 && gapLeft > 0) {
       live.retryTimer?.cancel()
       live.retryTimer = $.clock.after(gapLeft + 1000, () => void kick($, trigger))
+      const gap = `${Math.round(config.minGapMs / 60_000)}-minute gap between runs`
+      await update($, waitingAtom, () => `next automatic run at ${clockTime(now + gapLeft + 1000)} (${gap})`)
       return
     }
   }
+  await update($, waitingAtom, () => '')
+  await update($, rateHoldAtom, () => '')
   const c = await ensureCtx($)
   if (c === undefined) {
     await setPhase($, 'off', live.ctxError)
@@ -728,16 +1064,21 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   const memory = await loadMemory($, c)
   const intent = await recentIntent($)
 
+  const idea = ideaId !== undefined ? (await read($, ideasAtom)).find(i => i.id === ideaId) : undefined
   let chosen: Plan | undefined
   let kind: Trigger = trigger
-  if (focus !== undefined && focus.trim() !== '') {
+  if (idea !== undefined) {
+    chosen = ideaPlan(idea)
+  } else if (focus !== undefined && focus.trim() !== '') {
     chosen = manualPlan(focus)
   } else {
     const result = await choose($, c, trigger, tree, memory, intent)
     chosen = result.chosen
     kind = isManual ? 'manual' : result.kind
+    if (chosen !== undefined && result.kind === 'change') await offerIdea($, c, tree, memory, chosen.plan.idea)
     if (chosen === undefined) {
       await saveMemory($, c, memory)
+      if (!isManual && (kind === 'idle' || kind === 'sweep') && (await idleDiscovery($))) return
       if (result.note !== NO_CHANGE || isManual) await log($, `${kind}: ${result.note}`)
       await setPhase($, 'idle')
       return
@@ -756,13 +1097,19 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   const blobs = await blobsOf($, c.shadow, tree, plan.files)
   plan.files = plan.files.filter(file => blobs.has(file))
   const sorted = [...plan.files].sort()
-  const memoryKey = sorted.length > 0 ? sorted.join(',') : clip(plan.target, 200)
+  const targetKey = sorted.length > 0 ? sorted.join(',') : clip(plan.target, 200)
+  // a tried idea has its own memory: it must not mark the files tested, or hide them from the next scan
+  const memoryKey = idea !== undefined ? clip(`idea:${targetKey}`, 200) : targetKey
   const hash =
     sorted.length > 0 ? fnv(sorted.map(file => `${file}:${blobs.get(file) ?? ''}`).join('|')) : fnv(`${plan.target}:${tree}`)
   if (!isManual) {
     const tested = memory.tested[memoryKey]
     const dismissed = memory.dismissed[`${memoryKey}|${plan.kind}`]
-    if (tested?.hash === hash || dismissed?.hash === hash) {
+    const file = fileOf(plan.target)
+    // "dismiss all" covers the file itself: any finding of that kind there, until the file's content changes
+    const fileDismissed = memory.dismissed[fileDismissalKey(file, plan.kind)]
+    const isFileDismissed = fileDismissed !== undefined && fileDismissed.hash === blobs.get(file)
+    if (tested?.hash === hash || dismissed?.hash === hash || isFileDismissed) {
       await saveMemory($, c, memory)
       const why = tested?.hash === hash ? `tested (${tested.verdict})` : 'dismissed'
       await log($, `${kind}: ${memoryKey} was already ${why} at this version`)
@@ -775,22 +1122,27 @@ async function cycle($: $, trigger: Trigger, focus?: string): Promise<void> {
   const id = memory.nextId
   memory.nextId += 1
   await saveMemory($, c, memory)
-  await startRun($, c, { id, trigger: kind, plan, tokens, intent, tree, diff, memoryKey, hash })
+  await startRun($, c, { id, trigger: kind, plan, tokens, intent, tree, diff, memoryKey, hash, idea })
 }
 
-async function kick($: $, trigger: Trigger, focus?: string): Promise<void> {
+async function kick($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
   if (live.isCycling || (await read($, runAtom)) !== null) {
     if (live.pending === undefined || PRIORITY[trigger] > PRIORITY[live.pending]) live.pending = trigger
-    if (focus !== undefined) live.pendingFocus = focus
+    if (focus !== undefined) {
+      live.pendingFocus = focus
+      live.pendingIdea = ideaId
+    }
     return
   }
   live.isCycling = true
   try {
-    await cycle($, trigger, focus)
+    await cycle($, trigger, focus, ideaId)
   } catch (error) {
     await log($, `${trigger}: ${messageOf(error)}`)
     await setPhase($, 'idle')
   } finally {
+    // an idea that never reached a tester goes back to waiting for another try
+    if (ideaId !== undefined && (await read($, runAtom)) === null) await setIdeaStatus($, ideaId, 'new', 'trying')
     live.isCycling = false
     void drainPending($)
   }
@@ -800,9 +1152,11 @@ async function drainPending($: $): Promise<void> {
   if (live.pending === undefined || live.isCycling || (await read($, runAtom)) !== null) return
   const trigger = live.pending
   const focus = live.pendingFocus
+  const ideaId = live.pendingIdea
   live.pending = undefined
   live.pendingFocus = undefined
-  $.clock.after(2000, () => void kick($, trigger, focus))
+  live.pendingIdea = undefined
+  $.clock.after(2000, () => void kick($, trigger, focus, ideaId))
 }
 
 async function cleanupRuns($: $, c: Ctx): Promise<void> {
@@ -823,11 +1177,40 @@ async function cleanupRuns($: $, c: Ctx): Promise<void> {
 async function maybeSuggest($: $): Promise<void> {
   if (live.isMainBusy) return
   const [findings, suggested] = await Promise.all([read($, findingsAtom), read($, suggestedAtom)])
-  const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
+  const pending = findings.filter(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
+  // a verified fix is handed over even when a newer, unverified one waits for approval
+  const verified = pending.find(f => f.isVerified)
+  if (live.config.isAutoApplying && verified !== undefined) armAutoApply($, verified.id)
+  // the suggestion still shows while an automatic hand-off waits, so the person sees what is coming
+  const finding = pending[0]
   if (finding === undefined || finding.id === suggested) return
   const shown = await $.prompt.suggest({ text: handoffPrompt(finding) }).catch(() => ({ isShown: false }))
   if (shown.isShown) await update($, suggestedAtom, () => finding.id)
 }
+
+/** autoApplyVerifiedFixes: hand a verified fix over once the session has sat idle; a new turn cancels it. */
+function armAutoApply($: $, id: number): void {
+  live.autoTimer?.cancel()
+  live.autoTimer = $.clock.after(live.config.idleMs, () => {
+    live.autoTimer = undefined
+    void autoApply($, id)
+  })
+}
+
+async function autoApply($: $, id: number): Promise<void> {
+  if (live.isMainBusy || (await read($, pausedAtom))) return
+  const finding = (await read($, findingsAtom)).find(f => f.id === id)
+  if (finding === undefined || finding.status !== 'new') return
+  await log($, `#${id}: verified fix handed to Claude automatically`)
+  $.ui.toast(`stress-scout is handing verified fix #${id} to Claude`, { timeoutMs: 8000 })
+  await setStatus($, id, 'handing')
+  await handOff($, finding)
+}
+
+/** A finding Claude can act on: a fix to apply, or a next step for a real problem. */
+const canHandOver = (f: Finding): boolean => f.patch !== '' || (isActionable(f.verdict) && f.nextStep !== '')
+
+const handOverLabel = (f: Finding): string => (f.patch !== '' ? 'Apply via Claude' : 'Send to Claude')
 
 const blankFinding = (run: Run, at: number): Finding => ({
   id: run.id,
@@ -837,6 +1220,8 @@ const blankFinding = (run: Run, at: number): Finding => ({
   kind: run.kind,
   verdict: 'inconclusive',
   headline: '',
+  plain: '',
+  plainFix: '',
   evidence: '',
   before: '',
   after: '',
@@ -847,6 +1232,7 @@ const blankFinding = (run: Run, at: number): Finding => ({
   isVerified: false,
   nextStep: '',
   rerun: '',
+  files: run.files,
   snapshot: run.snapshot,
   confidence: 'low',
   status: 'new',
@@ -855,9 +1241,12 @@ const blankFinding = (run: Run, at: number): Finding => ({
   cost: 0,
   memoryKey: run.memoryKey,
   hash: run.hash,
+  fromIdea: run.fromIdea,
+  discovery: null,
 })
 
 async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
+  if (run.question !== '') return finishDiscovery($, run, outcome)
   const c = await ensureCtx($)
   const now = await $.clock.now()
   const report = parseReport(outcome.answer)
@@ -869,6 +1258,9 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
       await log($, `#${run.id}: could not read the fix back: ${messageOf(error)}`)
     }
   }
+  // the files the fix touches, as the snapshot held them: the handoff checks them against the project then
+  const targeted = report?.fix?.files.length ? report.fix.files : [(report?.target || run.target).replace(/:.*$/, '')]
+  const files = c !== undefined ? await blobsOf($, c.shadow, run.baseTree, targeted).catch(() => new Map<string, string>()) : new Map<string, string>()
   const patchPath = patch !== '' ? `${run.runDir}/fix.patch` : ''
   if (patchPath !== '') await $.fs.write(patchPath, `${patch}\n`)
   const finding: Finding = {
@@ -877,6 +1269,8 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
     kind: report?.kind || run.kind,
     verdict: report?.verdict ?? 'inconclusive',
     headline: report?.headline || outcome.failure || 'the tester finished without a report',
+    plain: report?.plain ?? '',
+    plainFix: report?.plainFix ?? '',
     evidence: report?.evidence ?? clip(oneLine(outcome.answer || outcome.failure), 600),
     before: report?.before ?? '',
     after: report?.after ?? '',
@@ -887,26 +1281,337 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
     isVerified: report?.fix?.isVerified === true && patch !== '',
     nextStep: report?.nextStep ?? '',
     rerun: report?.rerun ?? '',
+    files: unique([...run.files, ...(report?.fix?.files ?? [])]).filter(isProjectPath),
     confidence: report?.confidence ?? 'low',
     tokens: run.tokens + outcome.tokens,
     cost: outcome.cost,
+    origin: { branch: run.branch, head: run.head, files: Object.fromEntries(files) },
   }
   await update($, findingsAtom, list => [finding, ...list.filter(f => f.id !== finding.id)].slice(0, 25))
   await update($, tokensAtom, n => n + outcome.tokens)
   await update($, dollarsAtom, n => n + outcome.cost)
   await update($, runAtom, () => null)
-  if (c !== undefined && (report !== undefined || outcome.cost > 0)) {
+  if (c !== undefined) {
     const memory = await loadMemory($, c)
-    memory.tested[run.memoryKey] = { at: now, verdict: finding.verdict, kind: finding.kind, hash: run.hash }
+    if (report !== undefined || outcome.cost > 0) {
+      memory.tested[run.memoryKey] = { at: now, verdict: finding.verdict, kind: finding.kind, hash: run.hash }
+    }
+    // any run counts, so an idle sweep does not follow close behind a change test or a manual one
+    memory.lastRunEndedAt = now
     await saveMemory($, c, memory)
   }
   const verified = finding.isVerified ? ' · fix verified' : ''
   const spent = outcome.cost > 0 ? `, ${dollars(outcome.cost)}` : ''
   await log($, `#${run.id} ${finding.verdict}: ${finding.headline}${verified} (${ago(finding.durationMs)}${spent})`)
+  if (run.fromIdea > 0) await setIdeaStatus($, run.fromIdea, 'tried', 'trying')
   if (isActionable(finding.verdict)) {
     $.ui.toast(`stress-scout #${run.id} ${finding.verdict}: ${clip(finding.headline, 120)}`, { timeoutMs: 8000 })
     await maybeSuggest($)
+  } else if (run.fromIdea > 0) {
+    $.ui.toast(`stress-scout tried idea #${run.fromIdea} (#${run.id} ${finding.verdict}): ${clip(finding.headline, 120)}`, { timeoutMs: 8000 })
   }
+  await setPhase($, 'idle')
+  if (c !== undefined) await cleanupRuns($, c)
+  void drainPending($)
+}
+
+// ---- reruns: did the fix land? -----------------------------------------------------
+
+/**
+ * Reruns a finding's stored harness on the project's current files: no model, no tester.
+ * The target files are copied into its snapshot over the tester's own edit, then the rerun
+ * command runs there, guarded like the tester's own calls. Exit 0 (or a lone PASS line) means
+ * the fix holds; anything else, a timeout included, means the finding regressed.
+ */
+async function rerunFinding($: $, c: Ctx, finding: Finding): Promise<void> {
+  const files = (finding.files ?? []).filter(isProjectPath)
+  if (finding.rerun === '' || files.length === 0) return
+  if (!(await $.fs.exists(`${finding.snapshot}/.stress-scout/.keep`))) {
+    await log($, `#${finding.id}: its snapshot is gone, so the harness was not rerun`)
+    return
+  }
+  const runDir = finding.snapshot.replace(/[\\/]snapshot[\\/]?$/, '')
+  const box = sandboxOf(c, { runDir } as Run)
+  const check = checkBash(finding.rerun, box)
+  if (!check.isAllowed) {
+    await log($, `#${finding.id}: the stored harness command was refused, so it was not rerun: ${check.reason}`)
+    return
+  }
+  live.rerunning.add(finding.id)
+  try {
+    for (const file of files) {
+      const text = await $.fs.read(`${c.root}/${file}`).catch(() => undefined)
+      if (text !== undefined) await $.fs.write(`${finding.snapshot}/${file}`, text)
+    }
+    const shell = c.isWindows ? 'bash' : 'sh'
+    const result = await $.process
+      .run([shell, '-c', finding.rerun], {
+        cwd: finding.snapshot,
+        env: tempEnv(c.isWindows ? portable(`${runDir}/tmp`) : `${runDir}/tmp`, c.isWindows),
+        timeoutMs: RERUN_TIMEOUT_MS,
+      })
+      .catch(() => undefined)
+    const passed = result !== undefined && (result.exitCode === 0 || (/^\s*PASS(ED)?\s*$/m.test(result.stdout) && !/FAIL/i.test(result.stdout)))
+    const status: Finding['status'] = passed ? 'fixed' : 'regressed'
+    await update($, findingsAtom, list => list.map(f => (f.id === finding.id ? { ...f, status } : f)))
+    const detail = result === undefined ? 'timed out or could not run' : `exit ${result.exitCode}`
+    await log($, `#${finding.id} ${status}: the harness reran on the current files (${detail})`)
+  } catch (error) {
+    await log($, `#${finding.id}: the harness could not be rerun: ${messageOf(error)}`)
+  } finally {
+    live.rerunning.delete(finding.id)
+    live.rerun.add(finding.id)
+  }
+}
+
+/** Reruns the harness of every finding the edit `touched` (all that are due, when it is undefined). */
+async function rerunFindings($: $, touched?: readonly string[]): Promise<void> {
+  const all = await read($, findingsAtom)
+  const due = all.filter(f => {
+    if (!RERUN_STATUSES.has(f.status) || f.rerun === '') return false
+    if (touched === undefined) return live.staleReruns.has(f.id) || (f.status === 'applied' && !live.rerun.has(f.id))
+    return (f.files ?? []).some(file => touched.includes(file))
+  })
+  if (due.length === 0) return
+  const c = await ensureCtx($)
+  if (c === undefined) return
+  for (const finding of due) {
+    if (live.rerunning.has(finding.id)) {
+      live.staleReruns.add(finding.id)
+      continue
+    }
+    live.staleReruns.delete(finding.id)
+    await rerunFinding($, c, finding)
+  }
+}
+
+/** The project-relative path of the file a main-session edit touched; undefined outside the project. */
+function editedFile(c: Ctx, e: Record<string, unknown>): string | undefined {
+  const path = trimSlash(String(e.file_path ?? e.notebook_path ?? '')).replace(/\\/g, '/')
+  const root = c.root.replace(/\\/g, '/')
+  return path !== '' && isWithin(path, root, c.isWindows) ? path.slice(root.length + 1) : undefined
+}
+
+// ---- discovery: a question answered with evidence from this codebase ----------------------
+
+const DISCOVERY_HYPOTHESES = 'to be written first: 2 to 4 competing ones, each with a prediction and a kill criterion, saved before any experiment runs'
+const DISCOVERY_EXPERIMENT = 'the smallest harness in the sandbox that tells them apart, repeated at least 5 times, with median and spread'
+
+const discoveryTriage = (plan: DiscoveryPlan): Triage => ({
+  isWorth: true,
+  risk: 'high',
+  target: clip(plan.question, 200),
+  files: plan.files,
+  kind: 'discovery',
+  why: '',
+  attack: '',
+  skip: '',
+})
+
+/** Code files the question names, and an idea's own: hints for the tester, not a limit. */
+function hintFiles(question: string, shas: ReadonlyMap<string, string>, idea?: Idea): string[] {
+  const named = [...shas.keys()].filter(path => question.includes(path) || (basename(path).length >= 5 && question.includes(basename(path))))
+  return unique([...(idea?.files ?? []), ...named]).slice(0, 8)
+}
+
+/**
+ * Turns a question into a plan. A question the ledger already answers at this code is answered
+ * from it, with nothing run. Otherwise the plan waits in the pane for Run it, unless discoverWhenIdle is on.
+ */
+async function proposeDiscovery($: $, question: string, idea?: Idea, isHeld = false): Promise<string> {
+  const { config } = live
+  const text = clip(oneLine(question), 300)
+  if (text === '') return 'Usage: /stress discover <question>'
+  if (config.maxDiscoveries === 0) return 'Discovery is off: maxDiscoveriesPerSession is 0.'
+  const c = await ensureCtx($)
+  if (c === undefined) return `stress-scout is off: ${live.ctxError}`
+  const key = questionKey(text)
+  const shas = await shasOf($, c, await currentTree($, c))
+  const known = fromLedger(await loadLedger($, c), key, files => fingerprintOf(shas, files))
+  if (known !== undefined) return answerText(known)
+  const used = await read($, discoveriesUsedAtom)
+  if (used >= config.maxDiscoveries) return `This session's discovery cap is reached (${used}/${config.maxDiscoveries}).`
+  const plan: DiscoveryPlan = {
+    question: text,
+    key,
+    fromIdea: idea?.id ?? 0,
+    files: hintFiles(text, shas, idea),
+    hypotheses: DISCOVERY_HYPOTHESES,
+    experiment: DISCOVERY_EXPERIMENT,
+    cost: `up to ${dollars(config.maxDollarsPerDiscovery)} (the cap); most runs use a fraction of it`,
+  }
+  if (config.isDiscoveringWhenIdle) return runDiscovery($, plan, isHeld)
+  await update($, discoveryPlanAtom, () => plan)
+  await $.ui.open({ id: PANE, title: 'Stress Scout' }).catch(() => undefined)
+  return [
+    `Discovery plan for: ${text}`,
+    `Hypotheses: ${plan.hypotheses}.`,
+    `Experiment: ${plan.experiment}.`,
+    `Cost: ${plan.cost}.`,
+    `${config.isReadingSources ? 'It may read fresh sources on the web.' : 'It reads no web sources.'} Nothing runs until you press Run it in the pane.`,
+  ].join('\n')
+}
+
+/** Starts a discovery that was approved (the press, or discoverWhenIdle). `isHeld`: the caller is already inside a cycle. */
+async function runDiscovery($: $, plan: DiscoveryPlan, isHeld = false): Promise<string> {
+  const { config } = live
+  if (!isHeld && (live.isCycling || (await read($, runAtom)) !== null)) {
+    await update($, discoveryPlanAtom, () => plan)
+    return 'A test is running. Press Run it again when it has finished; the plan is kept.'
+  }
+  const used = await read($, discoveriesUsedAtom)
+  if (used >= config.maxDiscoveries) return `This session's discovery cap is reached (${used}/${config.maxDiscoveries}).`
+  const full = await fullWindow($)
+  if (full !== undefined) return `Your ${full.name} is at or above ${config.rateLimitPct}%, so the discovery waits.`
+  if (!isHeld) live.isCycling = true
+  try {
+    const c = await ensureCtx($)
+    if (c === undefined) return `stress-scout is off: ${live.ctxError}`
+    const tree = await currentTree($, c)
+    const memory = await loadMemory($, c)
+    const id = memory.nextId
+    memory.nextId += 1
+    await saveMemory($, c, memory)
+    const idea = (await read($, ideasAtom)).find(i => i.id === plan.fromIdea)
+    await update($, discoveryPlanAtom, () => null)
+    await update($, discoveriesUsedAtom, n => n + 1)
+    await setPhase($, 'triage', clip(plan.question, 60))
+    await startRun($, c, {
+      id,
+      trigger: 'manual',
+      plan: discoveryTriage(plan),
+      tokens: 0,
+      intent: await recentIntent($),
+      tree,
+      diff: '',
+      memoryKey: `disc:${plan.key}`,
+      hash: plan.key,
+      idea,
+      question: plan.question,
+    })
+    return `Researching "${clip(plan.question, 120)}" (#${id}). The result lands in /stress show.`
+  } finally {
+    if (!isHeld) {
+      live.isCycling = false
+      void drainPending($)
+    }
+  }
+}
+
+async function pressRunIt($: $): Promise<string> {
+  const plan = await read($, discoveryPlanAtom)
+  return plan === null ? 'No discovery plan is waiting.' : runDiscovery($, plan)
+}
+
+async function cancelPlan($: $): Promise<void> {
+  await update($, discoveryPlanAtom, () => null)
+}
+
+/** discoverWhenIdle: with nothing else due, research the newest idea not asked about yet. True when a run started. */
+async function idleDiscovery($: $): Promise<boolean> {
+  const { config } = live
+  if (!config.isDiscoveringWhenIdle || config.maxDiscoveries === 0) return false
+  const idea = (await read($, ideasAtom)).find(i => i.status === 'new' && !live.researched.has(i.id))
+  if (idea === undefined) return false
+  live.researched.add(idea.id)
+  await proposeDiscovery($, ideaQuestion(idea), idea, true)
+  return (await read($, runAtom)) !== null
+}
+
+async function researchIdea($: $, id: number): Promise<string> {
+  const idea = (await read($, ideasAtom)).find(i => i.id === id)
+  return idea === undefined ? `No idea #${id}.` : proposeDiscovery($, ideaQuestion(idea), idea)
+}
+
+/** Files what a discovery run found: a `discovery` finding, a ledger entry, and at most one idea. */
+async function finishDiscovery($: $, run: Run, outcome: Outcome): Promise<void> {
+  const c = await ensureCtx($)
+  const now = await $.clock.now()
+  const report = parseDiscovery(outcome.answer)
+  const registered = outcome.registered
+  const reg =
+    report !== undefined
+      ? checkPreRegistration(report.hypotheses, registered)
+      : {
+          isPreRegistered: false,
+          note:
+            registered !== undefined
+              ? 'a hypotheses file was seen, but the run ended without a report to compare it with'
+              : 'not pre-registered: no hypotheses file was seen',
+        }
+  const isPartial = outcome.failure !== '' || report === undefined
+  const survivor = report?.survivor ?? ''
+  const discovery: Discovery = {
+    question: run.question,
+    hypotheses: report?.hypotheses ?? [],
+    method: report?.method ?? '',
+    numbers: report?.numbers ?? [],
+    sources: report?.sources ?? [],
+    survivor,
+    effect: report?.effect ?? '',
+    confidence: isPartial ? 'low' : (report?.confidence ?? 'low'),
+    wouldChange: report?.wouldChange ?? '',
+    isSurprising: report?.isSurprising === true && !isPartial,
+    isPreRegistered: reg.isPreRegistered,
+    preRegNote: reg.note,
+    isPartial,
+  }
+  const said = report?.headline ?? ''
+  const headline = isPartial
+    ? `partial: ${outcome.failure || 'the tester finished without a report'}${said !== '' ? ` · ${said}` : ''}`
+    : said || (survivor === '' ? 'no hypothesis survived' : `${survivor} survived`)
+  const leftovers = report === undefined ? clip(oneLine(outcome.answer || outcome.failure), 300) : ''
+  const written = report === undefined && registered !== undefined ? `hypotheses file: ${clip(oneLine(registered.text), 400)}` : ''
+  const finding: Finding = {
+    ...blankFinding(run, now),
+    target: clip(run.question, 200),
+    kind: 'discovery',
+    verdict: isPartial ? 'inconclusive' : 'held',
+    headline: clip(headline, 220),
+    evidence: clip([numbersLine(discovery), written, leftovers].filter(part => part !== '').join(' · '), 900),
+    rerun: report?.rerun ?? '',
+    confidence: discovery.confidence,
+    tokens: run.tokens + outcome.tokens,
+    cost: outcome.cost,
+    discovery,
+  }
+  await update($, findingsAtom, list => [finding, ...list.filter(f => f.id !== finding.id)].slice(0, 25))
+  await update($, tokensAtom, n => n + outcome.tokens)
+  await update($, dollarsAtom, n => n + outcome.cost)
+  await update($, runAtom, () => null)
+  let isIdeaFiled = false
+  if (c !== undefined) {
+    const tree = (await hasTree($, c.shadow, run.baseTree).catch(() => false)) ? run.baseTree : await currentTree($, c)
+    const shas = await shasOf($, c, tree)
+    const files = (report?.files ?? []).filter(file => shas.has(file))
+    const entry: LedgerEntry = {
+      key: run.hash,
+      question: run.question,
+      at: now,
+      status: isPartial ? 'partial' : survivor === '' ? 'dead-end' : 'answered',
+      headline: finding.headline,
+      files,
+      fingerprint: fingerprintOf(shas, files),
+      isSurprising: discovery.isSurprising,
+      discovery,
+      rerun: finding.rerun,
+    }
+    const entries = [entry, ...(await loadLedger($, c)).filter(e => e.key !== entry.key)]
+    await saveLedger($, c, entries)
+    await $.fs.write(`${run.snapshot}/.stress-scout/discoveries.md`, renderLedger(entries)).catch(() => undefined)
+    // a result that implies a change becomes one idea, which /stress try can build and measure
+    if (report?.change !== undefined && !isPartial) {
+      const draft: IdeaDraft = { ...report.change, value: 10, type: report.change.type === 'feature' ? 'feature' : 'refinement' }
+      if (vetIdea(draft, draft.files).isOk) {
+        const memory = await loadMemory($, c)
+        isIdeaFiled = await fileIdea($, c, tree, memory, draft)
+        await saveMemory($, c, memory)
+      }
+    }
+  }
+  const spent = outcome.cost > 0 ? `, ${dollars(outcome.cost)}` : ''
+  await log($, `#${run.id} discovery${discovery.isSurprising ? ' (surprising)' : ''}: ${finding.headline} (${ago(finding.durationMs)}${spent})${isIdeaFiled ? ' · idea filed' : ''}`)
+  $.ui.toast(`stress-scout discovery #${run.id}${discovery.isSurprising ? ' (surprising)' : ''}: ${clip(finding.headline, 120)}`, { timeoutMs: 8000 })
   await setPhase($, 'idle')
   if (c !== undefined) await cleanupRuns($, c)
   void drainPending($)
@@ -920,6 +1625,7 @@ async function noteEdit($: $): Promise<void> {
   live.lastActivityAt = now
   if (live.firstDirtyAt === 0) live.firstDirtyAt = now
   const wait = Math.max(0, Math.min(quietMs, live.firstDirtyAt + maxWaitMs - now))
+  await update($, waitingAtom, () => `scanning the change at ${clockTime(now + wait)}, once edits settle`)
   live.quietTimer?.cancel()
   live.quietTimer = $.clock.after(wait, () => {
     live.firstDirtyAt = 0
@@ -961,7 +1667,9 @@ async function heartbeat($: $): Promise<void> {
     return
   }
   const isIdle = !live.isMainBusy && now - live.lastActivityAt >= config.idleMs
-  if (isIdle && config.isSweeping && now - memory.lastSweepAt >= config.sweepGapMs) void kick($, 'sweep')
+  if (isIdle && config.isSweeping && now - memory.lastSweepAt >= config.sweepGapMs && now - memory.lastRunEndedAt >= config.sweepGapMs) {
+    void kick($, 'sweep')
+  }
 }
 
 // ---- actions behind the buttons and /stress -------------------------------------------
@@ -974,32 +1682,90 @@ async function showPane($: $, id: number): Promise<void> {
 
 async function apply($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
-  if (finding === undefined) return `No finding #${id}.`
+  if (finding === undefined) {
+    const isIdea = (await read($, ideasAtom)).some(i => i.id === id)
+    return isIdea ? `Idea #${id} is untested: /stress try ${id} builds and checks it first.` : `No finding #${id}.`
+  }
   if (finding.patch === '' && finding.nextStep === '') return `Finding #${id} has no fix to hand over.`
+  // a regressed fix may be handed over again; one that holds may not
+  if (finding.status === 'handing' || finding.status === 'applied' || finding.status === 'fixed') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
+  // marked before the handoff is scheduled: the prompt only resolves once Claude is free, and repeat presses must not queue copies
+  await setStatus($, id, 'handing')
   // /stress apply's hook holds the turn a submitted prompt waits on: hand over once the command has answered
   $.clock.after(0, () => void handOff($, finding))
   return `Handing finding #${id} to Claude.`
 }
 
-/** Submits the handoff as the person's prompt; the finding counts as applied once it entered. */
+const setStatus = async ($: $, id: number, status: Finding['status']): Promise<void> => {
+  await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status } : f)))
+}
+
+/**
+ * What differs between the project now and where the finding was made: a line
+ * for the branch or commit, a line for the files the patch touches. '' when nothing does.
+ */
+async function driftNote($: $, finding: Finding): Promise<string> {
+  const origin = finding.origin
+  const c = await ensureCtx($)
+  if (origin === undefined || c === undefined) return ''
+  const label = (at: { branch: string; head: string }): string => (at.branch !== '' ? `${at.branch}@${at.head}` : at.head)
+  const notes: string[] = []
+  const now = await projectHead($, c.root)
+  if (origin.head !== '' && now.head !== '' && (now.head !== origin.head || now.branch !== origin.branch)) {
+    notes.push(`Made against ${label(origin)}; you're on ${label(now)}.`)
+  }
+  const paths = Object.keys(origin.files)
+  const current = await worktreeBlobs($, c.shadow, paths).catch(() => undefined)
+  // a file gone from the project counts as changed too
+  const changed = current === undefined ? [] : paths.filter(path => current.get(path) !== origin.files[path])
+  if (changed.length > 0) notes.push(`${changed.join(', ')} ${changed.length === 1 ? 'has' : 'have'} changed since the snapshot.`)
+  return notes.join('\n')
+}
+
+/** `/stress apply` with no number: the newest finding that has a patch or a next step to hand over. */
+async function applyNewest($: $): Promise<string> {
+  const newest = (await read($, findingsAtom))
+    .filter(f => f.status === 'new' && canHandOver(f))
+    .reduce<Finding | undefined>((best, f) => (best === undefined || f.id > best.id ? f : best), undefined)
+  return newest === undefined ? 'No finding is waiting to be applied.' : apply($, newest.id)
+}
+
+/** Submits the handoff as the person's prompt; the finding counts as applied once it entered, and is applicable again if it did not. */
 async function handOff($: $, finding: Finding): Promise<void> {
   try {
-    const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now()), asUser: true })
+    const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now(), await driftNote($, finding)), asUser: true })
     if (entered.drop !== undefined) {
       await log($, `#${finding.id} was not handed over: ${entered.drop}`)
+      await setStatus($, finding.id, 'new')
       return
     }
-    await update($, findingsAtom, list => list.map(f => (f.id === finding.id ? { ...f, status: 'applied' as const } : f)))
+    await setStatus($, finding.id, 'applied')
     await update($, seenAtom, seen => Math.max(seen, finding.id))
   } catch (error) {
     await log($, `#${finding.id} was not handed over: ${messageOf(error)}`)
+    await setStatus($, finding.id, 'new')
     $.ui.toast(`stress-scout could not hand #${finding.id} to Claude: ${clip(messageOf(error), 120)}`, { timeoutMs: 8000 })
   }
 }
 
+async function dismissIdea($: $, idea: Idea): Promise<string> {
+  await setIdeaStatus($, idea.id, 'dismissed')
+  await update($, seenAtom, seen => Math.max(seen, idea.id))
+  const c = await ensureCtx($)
+  if (c !== undefined) {
+    const memory = await loadMemory($, c)
+    memory.dismissed[`${idea.memoryKey}|idea`] = { at: await $.clock.now(), hash: idea.hash }
+    await saveMemory($, c, memory)
+  }
+  return `Dismissed idea #${idea.id}; it won't be suggested again unless that code changes.`
+}
+
 async function dismiss($: $, id: number): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
-  if (finding === undefined) return `No finding #${id}.`
+  if (finding === undefined) {
+    const idea = (await read($, ideasAtom)).find(i => i.id === id)
+    return idea !== undefined ? dismissIdea($, idea) : `No finding #${id}.`
+  }
   await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status: 'dismissed' as const } : f)))
   await update($, seenAtom, seen => Math.max(seen, id))
   const c = await ensureCtx($)
@@ -1009,6 +1775,27 @@ async function dismiss($: $, id: number): Promise<string> {
     await saveMemory($, c, memory)
   }
   return `Dismissed #${id}; it won't be raised again unless that code changes.`
+}
+
+/** Dismisses the finding and every other open one of its kind in its file, and drops that kind for the file until its content changes. */
+async function dismissAll($: $, id: number): Promise<string> {
+  const finding = (await read($, findingsAtom)).find(f => f.id === id)
+  if (finding === undefined) return `No finding #${id}.`
+  const file = fileOf(finding.target)
+  const isSame = (f: Finding): boolean => fileOf(f.target) === file && f.kind === finding.kind
+  await update($, findingsAtom, list =>
+    list.map(f => (isSame(f) && f.status === 'new' ? { ...f, status: 'dismissed' as const } : f)),
+  )
+  await update($, seenAtom, seen => Math.max(seen, id))
+  const c = await ensureCtx($)
+  if (c !== undefined) {
+    const tree = await currentTree($, c).catch(() => '')
+    const blobs = tree !== '' ? await blobsOf($, c.shadow, tree, [file]) : new Map<string, string>()
+    const memory = await loadMemory($, c)
+    memory.dismissed[fileDismissalKey(file, finding.kind)] = { at: await $.clock.now(), hash: blobs.get(file) ?? '' }
+    await saveMemory($, c, memory)
+  }
+  return `Dismissed every ${finding.kind} finding in ${file}; they won't be raised again unless that file changes.`
 }
 
 async function togglePause($: $, isPaused: boolean): Promise<string> {
@@ -1043,21 +1830,44 @@ async function runNow($: $, focus?: string): Promise<string> {
     : 'Stress-testing the latest change (or the riskiest untested code if nothing changed). Results land in /stress show.'
 }
 
+/** openPaneOnStart: a session with no surface yet (the app, the SDK) is tried again when its first turn starts. */
+async function autoOpenPane($: $): Promise<void> {
+  if (!live.config.isOpeningPane || live.isPaneShown) return
+  // with nothing attached (a -p run, an SDK host) ui.open has nowhere to place it and the engine logs an error
+  if ((await $.session.surfaces()).length === 0) return
+  const opened = await $.ui.open({ id: PANE, title: 'Stress Scout' }).catch(() => ({ isPlaced: false }))
+  live.isPaneShown = opened.isPlaced
+}
+
 async function openPane($: $): Promise<string> {
   await $.ui.open({ id: PANE, title: 'Stress Scout' })
   return 'Stress Scout pane opened.'
 }
 
+/** What the next automatic run waits on, in words. */
+function nextText(waiting: string, runsUsed: number): string {
+  const { config } = live
+  if (runsUsed >= config.maxRuns) return `the automatic cap (${runsUsed}/${config.maxRuns}) is reached; Run now still works`
+  if (waiting !== '') return waiting
+  return config.isSweeping
+    ? 'tests the next risky edit, or sweeps untested code when the session goes idle'
+    : 'tests the next risky edit'
+}
+
 async function statusText($: $): Promise<string> {
   const { config } = live
-  const [phase, findings, runsUsed, tokens, spent, paused, run] = await Promise.all([
+  const [phase, findings, ideas, runsUsed, tokens, spent, paused, run, waiting, plan, discoveries] = await Promise.all([
     read($, phaseAtom),
     read($, findingsAtom),
+    read($, ideasAtom),
     read($, runsUsedAtom),
     read($, tokensAtom),
     read($, dollarsAtom),
     read($, pausedAtom),
     read($, runAtom),
+    read($, waitingAtom),
+    read($, discoveryPlanAtom),
+    read($, discoveriesAtom),
   ])
   const now = await $.clock.now()
   const state =
@@ -1067,26 +1877,36 @@ async function statusText($: $): Promise<string> {
         ? 'Paused.'
         : phase.kind === 'off'
           ? `Off: ${phase.detail}.`
-          : 'Watching.'
+          : `Watching. Next: ${nextText(waiting, runsUsed)}.`
   const lines = [
     state,
     `automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} and ${compactTokens(tokens)} tokens this session · triage ${config.triageModel}, tester ${config.testerModel}`,
   ]
   for (const f of findings.slice(0, 6)) {
-    const flags = `${f.isVerified ? ' (fix verified)' : ''}${f.status !== 'new' ? ` [${f.status}]` : ''}`
+    const flags = `${f.isVerified ? ' (fix verified)' : ''}${f.fromIdea > 0 ? ` (from idea #${f.fromIdea})` : ''}${f.status !== 'new' ? ` [${f.status}]` : ''}`
     lines.push(`#${f.id} ${f.verdict} ${f.target}: ${f.headline}${flags}`)
   }
   if (findings.length === 0) lines.push('No findings yet.')
+  for (const idea of ideas.filter(i => i.status !== 'dismissed').slice(0, 3)) {
+    lines.push(`idea #${idea.id} (${idea.size}) ${idea.title}${idea.status !== 'new' ? ` [${idea.status}]` : ''}`)
+  }
+  if (plan !== null) lines.push(`discovery plan waiting for Run it: ${clip(plan.question, 120)} (${plan.cost})`)
+  for (const entry of discoveries.slice(0, 3)) {
+    lines.push(`discovery [${entry.status}${entry.isSurprising ? ', surprising' : ''}] ${clip(entry.question, 80)}: ${entry.headline}`)
+  }
   return lines.join('\n')
 }
 
 const HELP = [
-  '/stress            stress-test the latest change now (a sweep when nothing changed)',
+  '/stress            stress-test the latest change now (a sweep when nothing changed; also /stress run or start)',
   '/stress <focus>    stress-test something specific, e.g. /stress the retry logic in api/client.ts',
   '/stress show       open the Stress Scout pane',
   '/stress status     what it is doing and what it found',
-  '/stress apply N    hand finding N to Claude (patch and evidence attached)',
-  '/stress dismiss N  drop finding N; it is not raised again unless the code changes',
+  '/stress apply [N]  hand finding N to Claude (patch and evidence attached); no N: the newest one with a fix',
+  '/stress dismiss N  drop finding or idea N; it is not raised again unless the code changes',
+  '/stress dismiss N all  drop every finding of that kind in finding N\'s file, until the file changes',
+  '/stress try N      build idea N in the sandbox and measure it; the result is a finding that links back to it',
+  '/stress discover Q research a question with hypotheses, measurements and fresh sources; shows a plan, you press Run it',
   '/stress stop       stop the running test',
   '/stress pause | resume | forget',
 ].join('\n')
@@ -1098,6 +1918,7 @@ async function runCommand($: $, args: string): Promise<string> {
     case '':
     case 'now':
     case 'run':
+    case 'start':
       return runNow($)
     case 'show':
     case 'pane':
@@ -1111,9 +1932,15 @@ async function runCommand($: $, args: string): Promise<string> {
     case 'stop':
       return stopTester($)
     case 'apply':
-      return Number.isInteger(n) && n > 0 ? apply($, n) : 'Usage: /stress apply <finding number>'
+      if (rest[0] === undefined || rest[0] === '') return applyNewest($)
+      return Number.isInteger(n) && n > 0 ? apply($, n) : 'Usage: /stress apply [finding number]'
     case 'dismiss':
-      return Number.isInteger(n) && n > 0 ? dismiss($, n) : 'Usage: /stress dismiss <finding number>'
+      if (!Number.isInteger(n) || n <= 0) return 'Usage: /stress dismiss <finding or idea number> [all]'
+      return (rest[1] ?? '').toLowerCase() === 'all' ? dismissAll($, n) : dismiss($, n)
+    case 'try':
+      return Number.isInteger(n) && n > 0 ? tryIdea($, n) : 'Usage: /stress try <idea number>'
+    case 'discover':
+      return proposeDiscovery($, args.slice(verb.length))
     case 'forget':
       return forget($)
     case 'help':
@@ -1126,28 +1953,40 @@ async function runCommand($: $, args: string): Promise<string> {
 async function onSessionStart($: $): Promise<void> {
   if ((await $.env.get('STRESS_SCOUT_ROLE')) === 'tester') {
     live.role = 'tester'
+    live.hasWeb = (await $.env.get('STRESS_SCOUT_WEB')) === '1'
+    live.web = { sources: new Set(), queries: new Set() }
     live.box = await loadSandbox($)
+    const how = await $.env.get('STRESS_SCOUT_OFFLINE')
+    live.offline = how === 'sandbox-exec' || how === 'unshare' ? how : ''
     return
   }
   await $.command.register({
     name: 'stress',
-    description: 'stress-scout: stress-test the latest changes now (or a focus you name); show, status, stop, pause, resume',
-    argumentHint: '[focus | show | status | stop | pause | resume | apply N | dismiss N | forget]',
+    description: 'stress-scout: stress-test the latest changes now (or a focus you name); show, status, stop, pause, resume, discover a question',
+    argumentHint: '[focus | show | status | stop | pause | resume | apply [N] | try N | dismiss N [all] | discover question | forget]',
   })
   const stale = await read($, runAtom)
   if (stale !== null) {
     // the tester process ended with the module it belonged to
     await finishRun($, stale, { answer: '', cost: 0, tokens: 0, failure: 'interrupted: stress-scout reloaded while it ran', steps: 0 })
   }
+  // a handoff awaited by the module before this one never reports back: let the person press Apply again
+  const stuck = (await read($, findingsAtom)).filter(f => f.status === 'handing')
+  for (const f of stuck) {
+    await log($, `#${f.id}: stress-scout reloaded mid-handoff; Apply is offered again (check the prompt did not already go in)`)
+    await setStatus($, f.id, 'new')
+  }
   live.watchTimer?.cancel()
   live.watchTimer = $.clock.every(60_000, () => void heartbeat($))
   await setPhase($, 'idle')
+  await autoOpenPane($)
 }
 
 async function onMainTurnEnd($: $): Promise<void> {
   live.isMainBusy = false
   live.lastActivityAt = await $.clock.now()
   armIdle($)
+  await rerunFindings($).catch(() => undefined)
   await maybeSuggest($)
 }
 
@@ -1156,7 +1995,7 @@ async function handoff($: $, id: number): Promise<string | undefined> {
   if (finding === undefined) return undefined
   await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status: 'applied' as const } : f)))
   await update($, seenAtom, seen => Math.max(seen, id))
-  return handoffContext(finding, await $.clock.now())
+  return handoffContext(finding, await $.clock.now(), 30_000, await driftNote($, finding))
 }
 
 // ---- the hooks -------------------------------------------------------------------------
@@ -1171,7 +2010,7 @@ export const register: Register = (on, options) => {
   })
 
   on('session.end', ($, e, next) => {
-    for (const timer of [live.quietTimer, live.idleTimer, live.retryTimer, live.watchTimer]) timer?.cancel()
+    for (const timer of [live.quietTimer, live.idleTimer, live.retryTimer, live.watchTimer, live.autoTimer]) timer?.cancel()
     live.stopTester?.()
     return next(e)
   })
@@ -1181,6 +2020,9 @@ export const register: Register = (on, options) => {
       live.isMainBusy = true
       live.idleTimer?.cancel()
       live.idleTimer = undefined
+      live.autoTimer?.cancel()
+      live.autoTimer = undefined
+      void autoOpenPane($)
     }
     return next(e)
   })
@@ -1194,10 +2036,26 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     if (live.role === 'tester') {
       const check = await testerCheck($, String(e.tool), e as unknown as Record<string, unknown>)
-      return check.isAllowed ? next(e) : { deny: check.reason }
+      if (!check.isAllowed) return { deny: check.reason }
+      if (e.tool === 'WebSearch') {
+        live.web.queries.add(String(e.query))
+        const searched = await next(e)
+        for (const source of sourcesOf(searched.result)) live.web.sources.add(source)
+        return searched
+      }
+      // wrapped only once the guard has passed the original command
+      if (e.tool !== 'Bash' || live.offline === '' || typeof e.command !== 'string') return next(e)
+      const command = offlineCommand(live.offline, e.command)
+      live.wrapped.add(command)
+      return next({ ...e, command })
     }
     const ran = await next(e)
-    if (EDIT_TOOLS.has(String(e.tool)) && ran.deny === undefined && ran.isError !== true) await noteEdit($)
+    if (EDIT_TOOLS.has(String(e.tool)) && ran.deny === undefined && ran.isError !== true) {
+      await noteEdit($)
+      const c = await ensureCtx($)
+      const file = c !== undefined ? editedFile(c, e as unknown as Record<string, unknown>) : undefined
+      if (file !== undefined) await rerunFindings($, [file]).catch(() => undefined)
+    }
     return ran
   }).catch(($, e, next) =>
     next.called
@@ -1231,11 +2089,48 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (live.role === 'tester' || e.props.hasSurvey) return next(e)
-    const [findings, seenId] = await Promise.all([read($, findingsAtom), read($, seenAtom)])
+    const [findings, ideas, seenId, runsUsed, plan] = await Promise.all([
+      read($, findingsAtom),
+      read($, ideasAtom),
+      read($, seenAtom),
+      read($, runsUsedAtom),
+      read($, discoveryPlanAtom),
+    ])
     const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.id > seenId)
-    if (finding === undefined) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
     const isGraphical = e.surface !== 'terminal'
+    if (finding === undefined && plan !== null) {
+      // a discovery plan waits for a press before anything is spent
+      return (
+        <Box flexDirection="row" gap={isGraphical ? 'sm' : 1}>
+          <Text wrap="truncate-end" size={isGraphical ? 'footnote' : undefined}>
+            {`stress-scout discovery plan: ${plan.question} · ${plan.cost}`}
+          </Text>
+          <Button key="run-discovery" label="Run it" variant="primary" hotkey="r" onPress={() => void pressRunIt($)} />
+          <Button key="cancel-discovery" label="Cancel" hotkey="c" onPress={() => void cancelPlan($)} />
+        </Box>
+      )
+    }
+    if (finding === undefined) {
+      // an idea gets one quiet line, only while no broke/degraded finding waits and until it is seen
+      const idea = ideas.find(i => i.status === 'new' && i.id > seenId)
+      if (idea === undefined || findings.some(f => f.status === 'new' && isActionable(f.verdict))) return next(e)
+      return (
+        <Box flexDirection="row" gap={isGraphical ? 'sm' : 1}>
+          <Text dimColor wrap="truncate-end" size={isGraphical ? 'footnote' : undefined}>
+            {`stress-scout idea #${idea.id} (${idea.size}): ${idea.title}`}
+          </Text>
+          <Button key="try" label="Try it" hotkey="t" onPress={() => void tryIdea($, idea.id)} />
+          <Button key="dismiss" label="Dismiss" hotkey="x" onPress={() => void dismiss($, idea.id)} />
+        </Box>
+      )
+    }
+    const { maxDollarsPerRun, maxRuns } = live.config
+    const tidy = (n: number): string => dollars(n).replace(/\.00$/, '')
+    const budget =
+      finding.cost > 0
+        ? `${dollars(finding.cost)} · ${tidy(Math.max(0, maxDollarsPerRun - finding.cost))} left of ${tidy(maxDollarsPerRun)} per run · ${runsUsed}/${maxRuns} runs`
+        : ''
     const delta = finding.before !== '' && finding.after !== '' ? ` (${finding.before} → ${finding.after})` : ''
     // a graphical surface draws the band as a card edged in the verdict's theme color
     const card = isGraphical
@@ -1247,16 +2142,31 @@ export const register: Register = (on, options) => {
           <Text color={verdictColor(finding.verdict)} bold weight="semibold">
             {`stress-scout #${finding.id} ${finding.verdict}`}
           </Text>
-          <Text wrap="truncate-end" mono={isGraphical}>{`${finding.target}: ${finding.headline}`}</Text>
+          {finding.plain !== '' ? (
+            <Text wrap="wrap">{finding.plain}</Text>
+          ) : (
+            <Text wrap="truncate-end" mono={isGraphical}>{`${finding.target}: ${finding.headline}`}</Text>
+          )}
         </Box>
-        {finding.fixSummary !== '' && (
+        {finding.plain !== '' && finding.plainFix !== '' ? (
           <Text dimColor wrap="truncate-end" size="footnote">
-            {`${finding.isVerified ? 'verified fix' : 'unverified fix'}: ${finding.fixSummary}${delta}`}
+            {`${finding.isVerified ? 'Fix (tested)' : 'Fix (not tested)'}: ${finding.plainFix}`}
+          </Text>
+        ) : (
+          finding.fixSummary !== '' && (
+            <Text dimColor wrap="truncate-end" size="footnote">
+              {`${finding.isVerified ? 'verified fix' : 'unverified fix'}: ${finding.fixSummary}${delta}`}
+            </Text>
+          )
+        )}
+        {budget !== '' && (
+          <Text key="budget" dimColor wrap="truncate-end" size="footnote" tabular>
+            {budget}
           </Text>
         )}
         <Box flexDirection="row" gap={isGraphical ? 'xs' : 1}>
-          {finding.patch !== '' && (
-            <Button key="apply" label="Apply via Claude" variant="primary" hotkey="a" onPress={() => void apply($, finding.id)} />
+          {canHandOver(finding) && (
+            <Button key="apply" label={handOverLabel(finding)} variant="primary" hotkey="a" onPress={() => void apply($, finding.id)} />
           )}
           <Button key="details" label="Details" hotkey="d" onPress={() => void showPane($, finding.id)} />
           <Button key="dismiss" label="Dismiss" hotkey="x" onPress={() => void dismiss($, finding.id)} />
@@ -1270,9 +2180,10 @@ export const register: Register = (on, options) => {
     const { config } = live
     // the terminal keeps its compact rows; a graphical surface (the app, an editor, a phone) gets cards
     const isGraphical = e.surface !== 'terminal'
-    const [phase, findings, activity, runsUsed, tokens, spent, paused, openId, run] = await Promise.all([
+    const [phase, findings, ideas, activity, runsUsed, tokens, spent, paused, openId, run, waiting, plan, discoveries, discoveriesUsed] = await Promise.all([
       read($, phaseAtom),
       read($, findingsAtom),
+      read($, ideasAtom),
       read($, activityAtom),
       read($, runsUsedAtom),
       read($, tokensAtom),
@@ -1280,7 +2191,17 @@ export const register: Register = (on, options) => {
       read($, pausedAtom),
       read($, openAtom),
       read($, runAtom),
+      read($, waitingAtom),
+      read($, discoveryPlanAtom),
+      read($, discoveriesAtom),
+      read($, discoveriesUsedAtom),
     ])
+    const next = phase.kind === 'idle' && !paused ? nextText(waiting, runsUsed) : ''
+    // findings grouped under their file; groups run newest first by their newest finding, as the list does
+    const groups = new Map<string, Finding[]>()
+    // a surprising discovery leads, so its file's group comes first
+    const shown = [...findings].sort((a, b) => Number(b.discovery?.isSurprising === true) - Number(a.discovery?.isSurprising === true)).slice(0, 12)
+    for (const f of shown) groups.set(fileOf(f.target), [...(groups.get(fileOf(f.target)) ?? []), f])
     const state =
       phase.kind === 'off'
         ? `off: ${phase.detail}`
@@ -1307,6 +2228,18 @@ export const register: Register = (on, options) => {
       ) : (
         <Text key={key}>{`${label}: ${value}`}</Text>
       )
+    // what an open discovery card adds to the usual evidence rows
+    const discoveryRows = (d: Discovery) => [
+      d.hypotheses.length > 0 &&
+        detail('hypotheses', 'Hypotheses', d.hypotheses.map(h => `${h.id}: ${h.statement} (predicts ${h.prediction}; killed by ${h.kill})`).join('\n')),
+      d.method !== '' && detail('method', 'Method', d.method),
+      d.numbers.length > 0 &&
+        detail('numbers', 'Numbers', d.numbers.map(n => `${n.name}: ${n.median} (${n.spread}, ${n.runs} runs, ${n.origin === 'source' ? 'from a source' : 'measured here'})`).join('\n')),
+      detail('verdict', 'Verdict', `${d.survivor !== '' ? `${d.survivor} survived` : 'no hypothesis survived'}${d.effect !== '' ? ` · ${d.effect}` : ''} · confidence ${d.confidence}`),
+      d.wouldChange !== '' && detail('change', 'Would change if', d.wouldChange),
+      d.sources.length > 0 && detail('sources', 'Sources checked', d.sources.map(src => `${src.url} (${src.date || 'undated'}) ${src.note}`.trim()).join('\n')),
+      detail('prereg', 'Pre-registration', d.preRegNote),
+    ]
     return (
       <Box flexDirection="column" gap={section}>
         <Box flexDirection="column" gap={isGraphical ? 'xs' : 0}>
@@ -1316,6 +2249,11 @@ export const register: Register = (on, options) => {
           <Text dimColor size="footnote" tabular wrap="truncate-end">
             {`automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} · ${compactTokens(tokens)} tokens · ${mode}`}
           </Text>
+          {next !== '' && (
+            <Text key="next" dimColor size="footnote" wrap="wrap">
+              {`Next: ${next}`}
+            </Text>
+          )}
         </Box>
         <Box flexDirection="row" gap={row}>
           {run !== null ? (
@@ -1325,68 +2263,176 @@ export const register: Register = (on, options) => {
           )}
           <Button key="pause" label={paused ? 'Resume' : 'Pause'} onPress={() => void togglePause($, !paused)} />
         </Box>
+        {plan !== null && (
+          <Box
+            key="discovery-plan"
+            flexDirection="column"
+            gap="xs"
+            {...(isGraphical ? { borderStyle: 'round', borderColor: 'claude', padding: 'sm' as const } : {})}
+          >
+            <Text bold weight="semibold">Discovery plan</Text>
+            <Text wrap="wrap">{plan.question}</Text>
+            <Text dimColor size="footnote" wrap="wrap">{`Hypotheses: ${plan.hypotheses}.`}</Text>
+            <Text dimColor size="footnote" wrap="wrap">{`Experiment: ${plan.experiment}.`}</Text>
+            <Text dimColor size="footnote" wrap="wrap">{`Cost: ${plan.cost}. ${config.isReadingSources ? 'May read fresh sources on the web.' : 'Reads no web sources.'} ${discoveriesUsed}/${config.maxDiscoveries} discoveries this session.`}</Text>
+            <Box flexDirection="row" gap={row}>
+              <Button key="run-discovery" label="Run it" variant="primary" onPress={() => void pressRunIt($)} />
+              <Button key="cancel-discovery" label="Cancel" onPress={() => void cancelPlan($)} />
+            </Box>
+          </Box>
+        )}
         {findings.length === 0 && (
           <Text dimColor>
-            No findings yet. stress-scout tests risky changes as they land and sweeps untested code while the session is
-            idle. Type /stress to run one now.
+            No findings yet, and nothing for you to do: stress-scout tests each risky change once edits settle, sweeps
+            untested code while the session is idle, and puts what it finds here. Run now skips the wait.
           </Text>
         )}
-        {findings.slice(0, 12).map(f => {
-          const isOpen = openId === f.id
-          const isNew = f.status === 'new'
-          const delta = f.before !== '' && f.after !== '' ? ` (${f.before} → ${f.after})` : ''
-          const cost = f.cost > 0 ? ` · ${dollars(f.cost)}` : ''
-          const card = isGraphical
-            ? {
-                borderStyle: 'round',
-                borderColor: isNew ? verdictColor(f.verdict) : 'subtle',
-                borderDimColor: !isNew,
-                padding: 'sm' as const,
-                gap: 'xs' as const,
-              }
-            : {}
-          return (
-            <Box key={`finding-${f.id}`} flexDirection="column" {...card}>
-              <Box flexDirection="row" gap={row}>
-                <Text color={verdictColor(f.verdict)} bold weight="semibold">{`#${f.id} ${f.verdict}`}</Text>
-                <Text wrap="truncate-end" dimColor={!isNew} mono={isGraphical}>
-                  {`${f.target} · ${f.kind}${!isNew ? ` · ${f.status}` : ''}`}
-                </Text>
-              </Box>
-              <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={isGraphical && !isNew}>
-                {f.headline}
-              </Text>
-              {f.fixSummary !== '' && (
-                <Text dimColor size="footnote" wrap={isOpen ? 'wrap' : 'truncate-end'}>
-                  {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}
-                </Text>
-              )}
-              {isOpen && (
-                <Box flexDirection="column" gap={row}>
-                  {f.evidence !== '' && detail('evidence', 'Evidence', f.evidence)}
-                  {f.before !== '' && detail('before', 'Before', f.before)}
-                  {f.after !== '' && detail('after', 'After', f.after)}
-                  {f.fixExplanation !== '' && detail('why', 'Why it works', f.fixExplanation)}
-                  {f.nextStep !== '' && detail('next', 'Next step', f.nextStep)}
-                  <Text dimColor size="footnote" mono={isGraphical}>
-                    {`Harness: ${f.snapshot}/.stress-scout/${f.rerun !== '' ? `  ·  rerun: ${f.rerun}` : ''}`}
+        {[...groups].map(([file, items]) => (
+          <Box key={`file-${file}`} flexDirection="column" gap={row}>
+            <Text key="file" bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical} mono={isGraphical} wrap="truncate-end">
+              {file}
+            </Text>
+            {items.map(f => {
+              const isOpen = openId === f.id
+              const isNew = f.status === 'new'
+              const delta = f.before !== '' && f.after !== '' ? ` (${f.before} → ${f.after})` : ''
+              const cost = f.cost > 0 ? ` · ${dollars(f.cost)}` : ''
+              const card = isGraphical
+                ? {
+                    borderStyle: 'round',
+                    borderColor: isNew ? verdictColor(f.verdict) : 'subtle',
+                    borderDimColor: !isNew,
+                    padding: 'sm' as const,
+                    gap: 'xs' as const,
+                  }
+                : {}
+              return (
+                <Box key={`finding-${f.id}`} flexDirection="column" {...card}>
+                  <Box flexDirection="row" gap={row}>
+                    <Text color={verdictColor(f.verdict)} bold weight="semibold">
+                      {f.discovery !== null ? `#${f.id} discovery${f.discovery.isSurprising ? ' · surprising' : ''}${f.discovery.isPartial ? ' · partial' : ''}` : `#${f.id} ${f.verdict}`}
+                    </Text>
+                    <Text wrap="truncate-end" dimColor={!isNew} mono={isGraphical}>
+                      {`${f.target} · ${f.kind}${f.fromIdea > 0 ? ` · idea #${f.fromIdea}` : ''}${!isNew ? ` · ${f.status}` : ''}`}
+                    </Text>
+                  </Box>
+                  {f.plain !== '' && (
+                    <Text wrap="wrap" dimColor={isGraphical && !isNew}>
+                      {f.plain}
+                    </Text>
+                  )}
+                  <Text wrap={isOpen ? 'wrap' : 'truncate-end'} dimColor={f.plain !== '' || (isGraphical && !isNew)}>
+                    {f.headline}
                   </Text>
-                  <Text dimColor size="footnote" tabular>
-                    {`Took ${ago(f.durationMs)} · ${compactTokens(f.tokens)} tokens${cost} · confidence ${f.confidence}`}
-                  </Text>
-                  {f.patch !== '' && <Code source={clip(f.patch, 12_000)} format="diff" language="diff" />}
+                  {f.plain !== '' && f.plainFix !== '' && (
+                    <Text dimColor size="footnote" wrap="wrap">
+                      {`${f.isVerified ? 'Fix (tested)' : 'Fix (not tested)'}: ${f.plainFix}`}
+                    </Text>
+                  )}
+                  {f.fixSummary !== '' && (
+                    <Text dimColor size="footnote" wrap={isOpen ? 'wrap' : 'truncate-end'}>
+                      {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}
+                    </Text>
+                  )}
+                  {isOpen && (
+                    <Box flexDirection="column" gap={row}>
+                      {f.discovery !== null && discoveryRows(f.discovery)}
+                      {f.evidence !== '' && detail('evidence', 'Evidence', f.evidence)}
+                      {f.before !== '' && detail('before', 'Before', f.before)}
+                      {f.after !== '' && detail('after', 'After', f.after)}
+                      {f.fixExplanation !== '' && detail('why', 'Why it works', f.fixExplanation)}
+                      {f.nextStep !== '' && detail('next', 'Next step', f.nextStep)}
+                      <Text dimColor size="footnote" mono={isGraphical}>
+                        {`Harness: ${f.snapshot}/.stress-scout/${f.rerun !== '' ? `  ·  rerun: ${f.rerun}` : ''}`}
+                      </Text>
+                      <Text dimColor size="footnote" tabular>
+                        {`Took ${ago(f.durationMs)} · ${compactTokens(f.tokens)} tokens${cost} · confidence ${f.confidence}`}
+                      </Text>
+                      {f.patch !== '' && <Code source={clip(f.patch, 12_000)} format="diff" language="diff" />}
+                    </Box>
+                  )}
+                  <Box flexDirection="row" gap={row}>
+                    {isNew && canHandOver(f) && (
+                      <Button key={`apply-${f.id}`} label={handOverLabel(f)} variant="primary" onPress={() => void apply($, f.id)} />
+                    )}
+                    <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
+                    {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}
+                    {isNew && isOpen && (
+                      <Button
+                        key={`dismiss-all-${f.id}`}
+                        label={`Dismiss all ${f.kind} in ${clip(file, 40)}`}
+                        onPress={() => void dismissAll($, f.id)}
+                      />
+                    )}
+                  </Box>
                 </Box>
-              )}
-              <Box flexDirection="row" gap={row}>
-                {isNew && f.patch !== '' && (
-                  <Button key={`apply-${f.id}`} label="Apply via Claude" variant="primary" onPress={() => void apply($, f.id)} />
-                )}
-                <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
-                {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}
-              </Box>
-            </Box>
-          )
-        })}
+              )
+            })}
+          </Box>
+        ))}
+        {ideas.some(i => i.status !== 'dismissed') && (
+          <Box flexDirection="column" gap={row}>
+            <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>
+              Ideas
+            </Text>
+            {ideas
+              .filter(i => i.status !== 'dismissed')
+              .slice(0, 5)
+              .map(i => {
+                const card = isGraphical
+                  ? { borderStyle: 'round', borderColor: 'subtle', borderDimColor: true, padding: 'sm' as const, gap: 'xs' as const }
+                  : {}
+                return (
+                  <Box key={`idea-${i.id}`} flexDirection="column" {...card}>
+                    <Text dimColor wrap="truncate-end" mono={isGraphical}>
+                      {`#${i.id} idea · ${i.size} · ${i.files.join(', ')}${i.status !== 'new' ? ` · ${i.status}` : ''}`}
+                    </Text>
+                    <Text dimColor wrap="wrap">
+                      {i.title}
+                    </Text>
+                    {i.why !== '' && (
+                      <Text dimColor size="footnote" wrap="wrap">
+                        {i.why}
+                      </Text>
+                    )}
+                    {i.status !== 'trying' && (
+                      <Box flexDirection="row" gap={row}>
+                        <Button key={`try-${i.id}`} label={i.status === 'tried' ? 'Try again' : 'Try it'} onPress={() => void tryIdea($, i.id)} />
+                        {config.maxDiscoveries > 0 && (
+                          <Button key={`research-${i.id}`} label="Research this" onPress={() => void researchIdea($, i.id)} />
+                        )}
+                        <Button key={`dismiss-${i.id}`} label="Dismiss" onPress={() => void dismiss($, i.id)} />
+                      </Box>
+                    )}
+                  </Box>
+                )
+              })}
+          </Box>
+        )}
+        {discoveries.length > 0 && (
+          <Box flexDirection="column" gap={row}>
+            <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>
+              Discoveries
+            </Text>
+            {[...discoveries]
+              .sort((a, b) => Number(b.isSurprising) - Number(a.isSurprising))
+              .slice(0, 6)
+              .map(entry => (
+                <Box
+                  key={`discovery-${entry.key}`}
+                  flexDirection="column"
+                  {...(isGraphical ? { borderStyle: 'round', borderColor: entry.isSurprising ? 'warning' : 'subtle', borderDimColor: !entry.isSurprising, padding: 'sm' as const, gap: 'xs' as const } : {})}
+                >
+                  <Text wrap="wrap" bold={entry.isSurprising} weight={entry.isSurprising ? 'semibold' : undefined}>
+                    {`${entry.isSurprising ? 'surprising · ' : ''}${entry.status} · ${entry.question}`}
+                  </Text>
+                  <Text dimColor size="footnote" wrap="wrap">
+                    {entry.headline}
+                  </Text>
+                </Box>
+              ))}
+          </Box>
+        )}
         {activity.length > 0 && (
           <Box flexDirection="column" gap={isGraphical ? 'xs' : 0}>
             <Text bold weight="semibold" size={isGraphical ? 'caption' : undefined} dimColor={isGraphical}>

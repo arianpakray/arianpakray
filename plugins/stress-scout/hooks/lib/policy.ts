@@ -352,6 +352,14 @@ function segmentsOf(command: string): Segment[] {
       current += char
       continue
     }
+    if (char === '$' && command[i + 1] === "'") {
+      // $'..' honours \' inside, so `$'\'';` ends the string before the `;`
+      let end = i + 2
+      while (end < command.length && command[end] !== "'") end += command[end] === '\\' ? 2 : 1
+      current += command.slice(i, end + 1)
+      i = end
+      continue
+    }
     if (char === '"' || char === "'") {
       quote = char
       current += char
@@ -491,6 +499,12 @@ export function commandOf(tokens: readonly Token[]): { word: string; args: strin
       while (i < words.length && /^(-|\d+$)/.test(words[i] ?? '')) i++
       continue
     }
+    if (name === 'xargs') {
+      // `xargs -I {} git push {}` runs git: step past its flags, and the value of those that take one
+      i++
+      while (i < words.length && (words[i] ?? '').startsWith('-')) i += /^-[IdEaLnPs]$/.test(words[i] ?? '') ? 2 : 1
+      continue
+    }
     if (name === 'timeout') {
       i++
       while (i < words.length && (words[i] ?? '').startsWith('-')) {
@@ -505,8 +519,8 @@ export function commandOf(tokens: readonly Token[]): { word: string; args: strin
   return { word: '', args: [] }
 }
 
-/** Removes heredoc bodies fed to anything but an interpreter (they are file contents). */
-export function stripDataHeredocs(command: string): string {
+/** Removes heredoc bodies fed to anything but an interpreter (they are file contents); `isAll` removes code bodies too. */
+export function stripDataHeredocs(command: string, isAll = false): string {
   const lines = command.split('\n')
   const kept: string[] = []
   for (let i = 0; i < lines.length; i++) {
@@ -519,8 +533,8 @@ export function stripDataHeredocs(command: string): string {
     const isCode = INTERPRETERS.has(word.replace(/[0-9.]+$/, '')) || INTERPRETERS.has(word)
     const end = lines.findIndex((body, j) => j > i && body.trim() === heredoc[2])
     if (end < 0) continue
-    if (isCode) kept.push(...lines.slice(i + 1, end + 1))
-    else kept.push(heredoc[2] ?? '')
+    if (isCode && !isAll) kept.push(...lines.slice(i + 1, end + 1))
+    else if (!isAll) kept.push(heredoc[2] ?? '')
     i = end
   }
   return kept.join('\n')
@@ -585,6 +599,82 @@ const installTargetOk = (segment: string, flags: RegExp, box: Box, into = ''): b
   return false
 }
 
+/** The commands the tester may run at all; anything else is refused before the checks below look at what it touches. */
+const ALLOWED_COMMANDS = new Set([
+  'node',
+  'bun',
+  'cat',
+  'head',
+  'tail',
+  'ls',
+  'grep',
+  'wc',
+  'diff',
+  'mkdir',
+  'cp',
+  'mv',
+  'rm',
+  'tee',
+  'echo',
+  'sort',
+  'uniq',
+  // shell builtins and keyword tails the tester's scripts lean on
+  'cd',
+  'pushd',
+  'popd',
+  'test',
+  '[',
+  '[[',
+  'true',
+  'false',
+  'fi',
+  'done',
+])
+
+const ALLOWED_GIT = new Set(['diff', 'status', 'log', 'show'])
+const OPENSSL_KEY_MAKERS = new Set(['req', 'genrsa', 'genpkey', 'ecparam', 'x509'])
+
+/** curl flags that take a value, which is no host. */
+const CURL_VALUE_FLAGS = new Set([
+  '-H', '-d', '-o', '-X', '-m', '-u', '-A', '-e', '-b', '-c', '-F', '-T', '-w',
+  '--max-time', '--connect-timeout', '--retry', '--data', '--data-raw', '--data-binary',
+  '--header', '--output', '--request', '--user-agent', '--cookie', '--form',
+])
+
+/** True when every host curl is given is this machine: `127.0.0.1:8080/x`, `http://localhost/`. */
+const curlStaysLocal = (args: readonly string[]): boolean => {
+  let hasTarget = false
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] ?? ''
+    if (arg !== '--url' && CURL_VALUE_FLAGS.has(arg)) i++
+    else if (arg !== '--url' && arg.startsWith('-')) continue
+    else {
+      const target = arg === '--url' ? (args[++i] ?? '') : arg
+      const host = target
+        .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
+        .replace(/[/?#].*$/, '')
+        .replace(/:\d*$/, '')
+        .toLowerCase()
+      if (host !== '127.0.0.1' && host !== 'localhost') return false
+      hasTarget = true
+    }
+  }
+  return hasTarget
+}
+
+/** Whether a simple command's command word is one the tester may run. An empty word is a bare assignment; arithmetic is the inside of `$(( ))`, which bash may read as a subshell and so is checked as one. */
+function isOnAllowlist(name: string, args: readonly string[]): boolean {
+  if (name === '' || /^[\d+\-*/%()^~!=?:,.]+$/.test(name) || ALLOWED_COMMANDS.has(name)) return true
+  const sub = args.find(arg => !arg.startsWith('-')) ?? ''
+  if (name === 'git') return ALLOWED_GIT.has(args.find(arg => !arg.startsWith('-') && !/^[./~]/.test(arg)) ?? '')
+  if (name === 'npx') return sub === 'tsx'
+  if (name === 'npm') return /^(i|install|add|ci)$/.test(sub)
+  if (/^pip[0-9.]*$/.test(name)) return args.includes('install')
+  if (name === 'openssl') return OPENSSL_KEY_MAKERS.has(sub)
+  if (name === 'curl') return curlStaysLocal(args)
+  return /^(python[0-9.]*|py)$/.test(name)
+}
+
 /** Windows shells and system tools: the tester's Bash tool is Git Bash, and these reach past it. */
 const WINDOWS_TOOLS = new Set([
   'cmd',
@@ -616,10 +706,86 @@ export function checkBash(command: string, sandbox: Sandbox, depth = 0): Check {
   return bashCheck(command, boxOf(sandbox), depth)
 }
 
+/** Bodies of `$(...)`, `<(...)`, `>(...)` and backtick substitutions that run, outermost first; none inside single quotes. */
+const substitutionsOf = (text: string): string[] => substitutionSpans(text).map(span => span.body)
+
+/** A substitution's body, and where it sits in the text: `text.slice(from, to)` is the whole `$(...)`. */
+type Substitution = { body: string; from: number; to: number }
+
+function substitutionSpans(text: string): Substitution[] {
+  const found: Substitution[] = []
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i] ?? ''
+    if (char === '\\' && quote !== "'") {
+      i++
+      continue
+    }
+    if (quote === "'") {
+      if (char === "'") quote = ''
+      continue
+    }
+    if (char === '$' && text[i + 1] === "'" && quote === '') {
+      // $'..' honours \' inside
+      i += 2
+      while (i < text.length && text[i] !== "'") i += text[i] === '\\' ? 2 : 1
+    } else if (char === "'" && quote === '') quote = "'"
+    else if (char === '"') quote = quote === '"' ? '' : '"'
+    else if (char === '`') {
+      let end = i + 1
+      while (end < text.length && text[end] !== '`') end += text[end] === '\\' ? 2 : 1
+      // inside backticks \` \$ and \\ are escapes of the outer level
+      found.push({ body: text.slice(i + 1, end).replace(/\\([`$\\])/g, '$1'), from: i, to: end + 1 })
+      i = end
+    } else if (text[i + 1] === '(' && (char === '$' || (quote === '' && (char === '<' || char === '>')))) {
+      // `$((..))` is arithmetic only when it parses as such, else bash runs a subshell: its body is checked too
+      let level = 0
+      let end = i + 1
+      // the quote the body is inside: ' and " as in the shell, $ for $'..', where \' escapes
+      let inner = ''
+      for (; end < text.length; end++) {
+        const c = text[end] ?? ''
+        if (inner !== '') {
+          if (c === '\\' && inner !== "'") end++
+          else if (c === "'" && inner === '$') inner = ''
+          else if (c === inner) inner = ''
+        } else if (c === '\\') end++
+        else if (c === '$' && text[end + 1] === "'") {
+          inner = '$'
+          end++
+        } else if (c === "'" || c === '"') inner = c
+        else if (c === '(') level++
+        else if (c === ')' && --level === 0) break
+      }
+      found.push({ body: text.slice(i + 2, end), from: i, to: end + 1 })
+      i = end
+    }
+  }
+  return found
+}
+
 function bashCheck(command: string, box: Box, depth: number): Check {
   if (depth > 3) return deny('command nests too deeply to check')
   const text = stripDataHeredocs(command)
-  const word = '(?:^|[\\s;&|(`])'
+  for (const body of substitutionsOf(text)) {
+    const nested = bashCheck(body, box, depth + 1)
+    if (!nested.isAllowed) return nested
+  }
+  // allowlist first: the checks below say what an allowed command may touch, not which commands exist
+  // (substitution bodies were checked above, so this looks at what is left around them)
+  let outer = ''
+  let at = 0
+  for (const span of substitutionSpans(text)) {
+    outer += text.slice(at, span.from)
+    at = span.to
+  }
+  outer += text.slice(at)
+  // heredoc bodies are data or the interpreter's code, never shell
+  for (const { text: segment } of segmentsOf(stripDataHeredocs(outer, true))) {
+    const { word: name, args } = commandOf(tokenize(segment))
+    if (!isOnAllowlist(name, args)) return deny('not on the tester allowlist')
+  }
+  const word ='(?:^|[\\s;&|(`])'
 
   if (new RegExp(`${word}(sudo|doas|su)(\\s|$)`).test(text)) return deny('no sudo, doas or su')
   if (new RegExp(`${word}(mkfs\\S*|shutdown|reboot|halt|poweroff|launchctl|systemctl|crontab|diskutil|osascript)\\b`).test(text)) {

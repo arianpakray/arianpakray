@@ -136,13 +136,66 @@ export function removeTreeScript(path: string): string {
 
 /** Deletes a file or a folder tree, never through a link; true when it is gone. */
 export async function removeTree($: EngineInterface, path: string, isWindows: boolean, timeoutMs = 120_000): Promise<boolean> {
-  if (!isWindows) return (await $.process.run(['rm', '-rf', path], { timeoutMs })).exitCode === 0
+  // `--`: a path that starts with '-' is a path, not an option rm skips while answering success
+  if (!isWindows) return (await $.process.run(['rm', '-rf', '--', path], { timeoutMs })).exitCode === 0
   return (await powershell($, removeTreeScript(path), timeoutMs)).exitCode === 0
+}
+
+/**
+ * Creates file `path` holding `text`, failing when it already exists: one atomic
+ * create (O_EXCL through the shell's noclobber; CreateNew on Windows), so of two
+ * processes racing for it exactly one wins. True when this call created it.
+ */
+export async function createExclusive($: EngineInterface, path: string, text: string, isWindows: boolean): Promise<boolean> {
+  if (!isWindows) {
+    return (await $.process.run(['sh', '-c', 'set -C; printf %s "$1" > "$2"', 'sh', text, path], { timeoutMs: 10_000 })).exitCode === 0
+  }
+  const script = [
+    `try { $f = [IO.File]::Open(${psQuote(path.replace(/\//g, '\\'))}, 'CreateNew', 'Write') } catch { exit 1 }`,
+    `$b = [Text.Encoding]::UTF8.GetBytes(${psQuote(text)}); $f.Write($b, 0, $b.Length); $f.Close()`,
+  ].join('\n')
+  return (await powershell($, script, 30_000)).exitCode === 0
 }
 
 /** Links folder `link` to `target`: a symbolic link, or on Windows a junction (no admin rights needed). */
 export async function linkFolder($: EngineInterface, target: string, link: string, isWindows: boolean): Promise<boolean> {
-  if (!isWindows) return (await $.process.run(['ln', '-s', target, link])).exitCode === 0
+  // -n: an existing link to a folder fails the call, rather than gaining a link inside the folder it points to
+  if (!isWindows) return (await $.process.run(['ln', '-sn', '--', target, link])).exitCode === 0
   const script = `New-Item -ItemType Junction -Path ${psQuote(link.replace(/\//g, '\\'))} -Target ${psQuote(target.replace(/\//g, '\\'))} -ErrorAction Stop | Out-Null`
   return (await powershell($, script, 60_000)).exitCode === 0
 }
+
+/** How the tester's shell commands are cut off from the network; '' leaves the guard alone. */
+export type Offline = 'sandbox-exec' | 'unshare' | ''
+
+/** macOS: everything but outbound network, except loopback and local sockets so a test can still talk to a server it starts. */
+export const NO_NETWORK_PROFILE =
+  '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote unix-socket))(allow network-outbound (remote ip "localhost:*"))'
+
+/** `text` as one single-quoted shell word. */
+export const shQuote = (text: string): string => `'${text.replace(/'/g, "'\\''")}'`
+
+/**
+ * Which tool can run a command without network here, found by trying it: macOS
+ * `sandbox-exec`, Linux `unshare -rn` (an unprivileged network namespace).
+ * Windows has neither, so it stays ''.
+ */
+export async function probeOffline($: EngineInterface, isWindows: boolean): Promise<Offline> {
+  if (isWindows) return ''
+  const kernel = (await $.process.run(['uname', '-s'], { timeoutMs: 10_000 }).catch(() => undefined))?.stdout.trim()
+  const argv =
+    kernel === 'Darwin'
+      ? ['sandbox-exec', '-p', NO_NETWORK_PROFILE, '/usr/bin/true']
+      : kernel === 'Linux'
+        ? ['unshare', '-rn', 'true']
+        : undefined
+  if (argv === undefined) return ''
+  const probe = await $.process.run(argv, { timeoutMs: 10_000 }).catch(() => undefined)
+  return probe?.exitCode === 0 ? (kernel === 'Darwin' ? 'sandbox-exec' : 'unshare') : ''
+}
+
+/** `command` run under bash with the network cut off by `how`. */
+export const offlineCommand = (how: Exclude<Offline, ''>, command: string): string =>
+  how === 'sandbox-exec'
+    ? `sandbox-exec -p ${shQuote(NO_NETWORK_PROFILE)} /bin/bash -c ${shQuote(command)}`
+    : `unshare -rn bash -c ${shQuote(command)}`

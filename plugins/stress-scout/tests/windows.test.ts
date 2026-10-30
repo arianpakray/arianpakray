@@ -90,6 +90,7 @@ describe('on Windows the guard refuses what could hurt the project, secrets or t
     'powershell -c Get-ChildItem',
     'cmd.exe //c "del C:\\x"',
     'reg query HKCU',
+    'echo $(cmd //c dir)',
   ]
   for (const command of refused) {
     test(command, () => {

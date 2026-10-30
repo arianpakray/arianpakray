@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.2.1",
+  "version": "0.4.0",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
@@ -71,6 +71,60 @@
       "type": "number",
       "title": "Max dollars per test run",
       "description": "The tester stops when one run reaches this cost (claude --max-budget-usd).",
+      "default": 2
+    },
+    "openPaneOnStart": {
+      "type": "boolean",
+      "title": "Open the Stress Scout pane in every session",
+      "description": "Open the pane when a session starts (or when the app first attaches to it). Close it any time; /stress show brings it back.",
+      "default": true
+    },
+    "autoApplyVerifiedFixes": {
+      "type": "boolean",
+      "title": "Hand verified fixes to Claude automatically",
+      "description": "When a test proves its own fix and the session has been idle for the idle seconds, send the fix to Claude without a tap.",
+      "default": true
+    },
+    "testerOffline": {
+      "type": "boolean",
+      "title": "Run the tester without network",
+      "description": "Cut the network off from the commands the tester runs (sandbox-exec on macOS, unshare on Linux); the tester itself still reaches the model.",
+      "default": true
+    },
+    "suggestImprovements": {
+      "type": "boolean",
+      "title": "Suggest improvements",
+      "description": "Now and then, the same triage call also suggests one small improvement to what you are building; it shows under Ideas in the pane, and /stress try N builds and checks it in the sandbox.",
+      "default": true
+    },
+    "maxIdeasPerSession": {
+      "type": "number",
+      "title": "Max ideas per session",
+      "description": "Hard cap on suggested improvements shown in one session.",
+      "default": 5
+    },
+    "discoverSources": {
+      "type": "boolean",
+      "title": "Discovery may read fresh sources",
+      "description": "A discovery run may use WebSearch and WebFetch to find release notes, changelogs, papers and benchmarks newer than the model's cutoff. Off keeps discovery to measurements in the sandbox.",
+      "default": true
+    },
+    "discoverWhenIdle": {
+      "type": "boolean",
+      "title": "Research an idea when idle",
+      "description": "When nothing else is due, research the newest idea without waiting for Run it. Off: a discovery only starts when you press Run it.",
+      "default": false
+    },
+    "maxDollarsPerDiscovery": {
+      "type": "number",
+      "title": "Max dollars per discovery",
+      "description": "A discovery stops at this cost and records a partial result.",
+      "default": 5
+    },
+    "maxDiscoveriesPerSession": {
+      "type": "number",
+      "title": "Max discoveries per session",
+      "description": "Hard cap on discoveries started in one session; 0 turns discovery off.",
       "default": 2
     },
     "claudePath": {

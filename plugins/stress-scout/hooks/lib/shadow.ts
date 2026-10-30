@@ -9,7 +9,7 @@
  */
 import type { EngineInterface, ProcessRunResult } from 'claude-code'
 
-import { isWindowsPath, linkFolder, removeTree } from './platform'
+import { createExclusive, isWindowsPath, linkFolder, removeTree } from './platform'
 import { parseChurn, parseLsTree, type TreeFile } from './rank'
 import { exclusive } from './util'
 
@@ -197,13 +197,61 @@ async function projectGit($: EngineInterface, root: string, args: readonly strin
   })
 }
 
+/** The project's branch (empty when detached) and short HEAD; both empty outside git or before a first commit. */
+export async function projectHead($: EngineInterface, root: string): Promise<{ branch: string; head: string }> {
+  const head = await projectGit($, root, ['rev-parse', '--short', 'HEAD'])
+  if (head.exitCode !== 0) return { branch: '', head: '' }
+  const branch = await projectGit($, root, ['symbolic-ref', '-q', '--short', 'HEAD'])
+  return { branch: branch.exitCode === 0 ? branch.stdout.trim() : '', head: head.stdout.trim() }
+}
+
+/** Blob ids of `paths` as the project holds them now, hashed the way the shadow stores them; a missing file is left out. */
+export async function worktreeBlobs($: EngineInterface, shadow: Shadow, paths: readonly string[]): Promise<Map<string, string>> {
+  const blobs = new Map<string, string>()
+  for (const path of paths) {
+    const out = await git($, shadow, ['hash-object', '--', path], { isTolerant: true })
+    if (out.exitCode === 0 && out.stdout.trim() !== '') blobs.set(path, out.stdout.trim())
+  }
+  return blobs
+}
+
 /**
  * Opens (creating on first use) the shadow repository for `root` under `scratch`.
  * Like every write to the shadow, it waits for the one before it on that scratch:
  * the shadow index admits a single writer, and a heartbeat can meet a cycle.
  */
 export function openShadow($: EngineInterface, root: string, scratch: string): Promise<Shadow> {
-  return exclusive(scratch, () => openShadowNow($, root, scratch))
+  return exclusive(scratch, () => withScratchLock($, scratch, isWindowsPath(root), () => openShadowNow($, root, scratch)))
+}
+
+/** Longer than a held section can run (its gits are killed at 3 minutes): a lock this old lost its session. */
+const SCRATCH_LOCK_STALE_MS = 15 * 60_000
+const SCRATCH_LOCK_WAIT_MS = 120_000
+
+/**
+ * `exclusive` orders work inside one process only; two sessions in one project
+ * share the scratch, and one's rebuild would delete shadow.git under the other's
+ * git. A lock file created atomically orders the processes too. It holds a token,
+ * so a holder whose lock was broken as stale never deletes the next one's.
+ */
+async function withScratchLock<T>($: EngineInterface, scratch: string, isWindows: boolean, task: () => Promise<T>): Promise<T> {
+  const lock = `${scratch}/shadow.lock`
+  const token = crypto.randomUUID()
+  const deadline = (await $.clock.now()) + SCRATCH_LOCK_WAIT_MS
+  await $.fs.write(`${scratch}/.keep`, '')
+  while (!(await createExclusive($, lock, token, isWindows))) {
+    const stat = await $.fs.stat(lock).catch(() => undefined)
+    const now = await $.clock.now()
+    if (stat !== undefined && now - stat.mtimeMs >= SCRATCH_LOCK_STALE_MS) await removeTree($, lock, isWindows, 30_000)
+    else if (now >= deadline) throw new ShadowLocked('the shadow is in use by another session in this project')
+    else await $.clock.sleep(250)
+  }
+  try {
+    return await task()
+  } finally {
+    const held = await $.fs.read(lock).catch(() => '')
+    if (held === token) await removeTree($, lock, isWindows, 30_000)
+  }
 }
 
 async function openShadowNow($: EngineInterface, root: string, scratch: string): Promise<Shadow> {
@@ -234,16 +282,18 @@ async function resetShadowNow($: EngineInterface, shadow: Shadow): Promise<void>
  * One exclusive section, so no other writer meets the shadow half rebuilt.
  */
 export function fingerprintOrRebuild($: EngineInterface, shadow: Shadow): Promise<{ shadow: Shadow; tree: string }> {
-  return exclusive(shadow.scratch, async () => {
-    try {
-      return { shadow, tree: await fingerprintNow($, shadow) }
-    } catch (error) {
-      if (error instanceof ShadowLocked) throw error
-      await resetShadowNow($, shadow)
-      const rebuilt = await openShadowNow($, shadow.root, shadow.scratch)
-      return { shadow: rebuilt, tree: await fingerprintNow($, rebuilt) }
-    }
-  })
+  return exclusive(shadow.scratch, () =>
+    withScratchLock($, shadow.scratch, shadow.isWindows, async () => {
+      try {
+        return { shadow, tree: await fingerprintNow($, shadow) }
+      } catch (error) {
+        if (error instanceof ShadowLocked) throw error
+        await resetShadowNow($, shadow)
+        const rebuilt = await openShadowNow($, shadow.root, shadow.scratch)
+        return { shadow: rebuilt, tree: await fingerprintNow($, rebuilt) }
+      }
+    }),
+  )
 }
 
 async function fingerprintNow($: EngineInterface, shadow: Shadow): Promise<string> {

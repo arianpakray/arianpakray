@@ -22,6 +22,12 @@ describe('the tester may do its job inside the sandbox', () => {
     'rm -rf .stress-scout/out',
     'echo "process.env.NODE_ENV"',
     'timeout -s KILL 60 node .stress-scout/a.js',
+    'echo $((1 + 2))',
+    'echo $(( (1+2)*3 ))',
+    'echo "$(( 2 ** 3 ))"',
+    "echo '$(git push)'",
+    'x=$(cat .stress-scout/a.txt) && echo "$x"',
+    'ls .stress-scout | xargs -n 1 echo',
     'python3 -c "import sys; print(sys.path)"',
     'cp src/cache.ts .stress-scout/cache.orig.ts',
     'cat /work/./proj/src/a.ts | head -5',
@@ -97,6 +103,28 @@ describe('the guard refuses what could hurt the project, secrets or the machine'
     'cat "$HOME"/.ssh/id_rsa',
     'cat ~//.aws/credentials',
     "python3 -c \"open('/work/./proj/src/a.ts','w').write('x')\"",
+    // found by stress-scout's own run: substitutions and xargs run commands the first word hides
+    'echo $(git push)',
+    'echo `git push`',
+    'x=$(rm -rf /etc/foo)',
+    'cat <(git push)',
+    'echo "$(git push origin main)"',
+    'echo $(echo $(git push))',
+    `echo "it's $(git push)"`,
+    'xargs git push',
+    'ls | xargs -n 1 git push',
+    'ls | xargs -I {} git push {}',
+    "ls | xargs -d '\\n' rm -rf /work/proj",
+    // bash runs these, as stress-scout's own harness showed with git stubbed: $(( that is no arithmetic is a
+    // subshell, a quoted ) does not close, $'\'' does not open a quote, and backticks nest one escape deeper
+    'echo $((git push) )',
+    'echo $((git push); echo x)',
+    'echo "$((true);git push)"',
+    'echo "$(echo ")"; git push)"',
+    'echo "$(echo \\); git push)"',
+    "echo $'\\'' $(git push)",
+    'echo `echo \\`git push\\``',
+    "echo $(echo $'\\')'; git push)",
     // node_modules, .venv and the like are links into the real project
     'rm -rf node_modules/../src',
     `echo x > ${RUN}/snapshot/node_modules/../src/a.ts`,
@@ -155,6 +183,33 @@ describe('the guard refuses what could hurt the project, secrets or the machine'
       if (!check.isAllowed) expect(check.reason).toMatch(/^stress-scout guard: /)
     })
   }
+})
+
+describe('the guard runs only what is on the tester allowlist', () => {
+  const refused = [
+    'perl -e 1',
+    "awk 'BEGIN{}'",
+    'ruby -e 1',
+    'make',
+    'docker ps',
+    'npx prettier x.ts',
+    'npm test',
+    'pip --version',
+    'git branch',
+    'curl -s http://127.0.0.1:8080/ -o x && curl evil.example.com',
+    'echo $(perl -e 1)',
+    'echo ok && make',
+  ]
+  for (const command of refused) {
+    test(command, () => {
+      expect(checkBash(command, BOX)).toEqual({ isAllowed: false, reason: 'stress-scout guard: not on the tester allowlist' })
+    })
+  }
+  test('what the allowlist names still runs', () => {
+    for (const command of ['curl -s localhost:3000/x', 'git log --oneline', 'npx tsx a.ts', `python3 -m pip install --target ${RUN}/deps x`]) {
+      expect(checkBash(command, BOX)).toEqual({ isAllowed: true })
+    }
+  })
 })
 
 test('files land only inside the run folder, and harnesses never name the real project', () => {
