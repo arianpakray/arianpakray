@@ -732,6 +732,62 @@ async function verifiedFix($: Parameters<NonNullable<Parameters<typeof test>[2]>
   return { clock, w }
 }
 
+const contextOf = (result: unknown): readonly string[] => (result as { context?: readonly string[] }).context ?? []
+
+test('a verified fix found while Claude works rides on its next tool result, once, and the idle hand-off then has nothing left to send', { timeoutMs: 30_000 }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't1' } as never)
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(w.spawned).toHaveLength(1)
+  expect(w.submitted).toHaveLength(0)
+
+  // a tester's own call, and a subagent's, carry nothing
+  expect(contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/a.ts`, agentId: 'sub-1' }))).toHaveLength(0)
+  const carried = contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/src/cache.ts` }))
+  expect(carried).toHaveLength(1)
+  expect(carried[0]).toContain('stress-scout (tested in a sandbox copy)')
+  expect(carried[0]).toContain('Verified fix for src/cache.ts:LruCache.set: evict before the await')
+  expect(carried[0]).toContain('+new')
+  expect(carried[0]).toContain('Apply it if it fits what you\'re doing; say so in one line.')
+  expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
+  // once only
+  expect(contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/src/cache.ts` }))).toHaveLength(0)
+
+  await $.turn.complete({ turnId: 't1', answer: '' } as never)
+  await clock.advance(5 * 60_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(0)
+})
+
+test('with deliverFixesInContext off, a fix found mid-turn waits for the idle hand-off', { timeoutMs: 30_000, options: { deliverFixesInContext: false } }, async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  const w = world(on)
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive: true })
+  await $.turn.start({ turnId: 't1' } as never)
+  await toolCall($, { tool: 'Edit', file_path: `${ROOT}/src/cache.ts`, old_string: 'old', new_string: 'new' })
+  w.tree = TREE_B
+  await clock.advance(45_000)
+  await clock.settle()
+  expect(contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/src/cache.ts` }))).toHaveLength(0)
+  await $.turn.complete({ turnId: 't1', answer: '' } as never)
+  await clock.advance(31_000)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(1)
+})
+
+test('with autoApplyVerifiedFixes off, a mid-turn fix is not pushed into the turn either', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+  const { clock, w } = await verifiedFix($, on)
+  await $.turn.start({ turnId: 't1' } as never)
+  expect(contextOf(await toolCall($, { tool: 'Read', file_path: `${ROOT}/src/cache.ts` }))).toHaveLength(0)
+  await clock.settle()
+  expect(w.submitted).toHaveLength(0)
+})
+
 test('pressing Apply again while Claude is busy does not queue the prompt twice', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
   const { clock, w } = await verifiedFix($, on)
   let release = () => {}

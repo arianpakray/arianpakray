@@ -127,6 +127,7 @@ type Config = {
   isSweeping: boolean
   sweepGapMs: number
   isAutoApplying: boolean
+  isDeliveringFixes: boolean
   isOpeningPane: boolean
   maxDollarsPerRun: number
   claudePath: string
@@ -174,6 +175,7 @@ export function configOf(options: PluginOptions): Config {
     isSweeping: options.sweepWhenIdle !== false,
     sweepGapMs: numberOf(options.sweepMinutes, 20, 1, 1440) * 60_000,
     isAutoApplying: options.autoApplyVerifiedFixes !== false,
+    isDeliveringFixes: options.deliverFixesInContext !== false,
     isOpeningPane: options.openPaneOnStart !== false,
     maxDollarsPerRun: numberOf(options.maxDollarsPerRun, 2, 0.05, 100),
     claudePath: typeof options.claudePath === 'string' ? options.claudePath.trim() : '',
@@ -220,6 +222,8 @@ const live = {
   isCycling: false,
   pending: undefined as Trigger | undefined,
   pendingFocus: undefined as string | undefined,
+  /** Findings whose fix rode on a tool result already: claimed before the first await, so two parallel calls never both send it. */
+  delivered: new Set<number>(),
   /** ideas the idle pick has already asked about this session */
   researched: new Set<number>(),
   /** the suggestion a queued /stress try is for */
@@ -1224,6 +1228,20 @@ async function autoApply($: $, id: number): Promise<void> {
   await handOff($, finding)
 }
 
+/** deliverFixesInContext: a verified fix for the busy main session, as the note its next tool result carries. */
+async function fixNote($: $): Promise<string | undefined> {
+  const { config } = live
+  if (!config.isDeliveringFixes || !config.isAutoApplying || !live.isMainBusy || (await read($, pausedAtom))) return undefined
+  const finding = (await read($, findingsAtom)).find(f => f.status === 'new' && f.isVerified && isActionable(f.verdict) && f.patch !== '' && !live.delivered.has(f.id))
+  if (finding === undefined) return undefined
+  live.delivered.add(finding.id)
+  await setStatus($, finding.id, 'applied')
+  await update($, seenAtom, seen => Math.max(seen, finding.id))
+  await log($, `#${finding.id}: verified fix handed to Claude in the running turn`)
+  const said = (finding.plain || finding.headline).replace(/[.\s]+$/, '')
+  return `stress-scout (tested in a sandbox copy): ${said}. Verified fix for ${finding.target}: ${finding.fixSummary}. Patch:\n${clip(finding.patch, 4000)}\nApply it if it fits what you're doing; say so in one line.`
+}
+
 /** A finding Claude can act on: a fix to apply, or a next step for a real problem. */
 const canHandOver = (f: Finding): boolean => f.patch !== '' || (isActionable(f.verdict) && f.nextStep !== '')
 
@@ -2078,7 +2096,9 @@ export const register: Register = (on, options) => {
       const file = c !== undefined ? editedFile(c, e as unknown as Record<string, unknown>) : undefined
       if (file !== undefined) await rerunFindings($, [file]).catch(() => undefined)
     }
-    return ran
+    if (e.agentId !== undefined || ran.deny !== undefined) return ran
+    const note = await fixNote($).catch(() => undefined)
+    return note === undefined ? ran : { ...ran, context: [...(ran.context ?? []), note] }
   }).catch(($, e, next) =>
     next.called
       ? next(e)

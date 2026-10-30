@@ -91,6 +91,12 @@
       "description": "When a test proves its own fix and the session has been idle for the idle seconds, send the fix to Claude without a tap.",
       "default": true
     },
+    "deliverFixesInContext": {
+      "type": "boolean",
+      "title": "Hand verified fixes over mid-task",
+      "description": "When a fix is verified while Claude is working, attach it to Claude's next tool result instead of waiting for the turn to end. Needs automatic hand-off on; off keeps the idle hand-off only.",
+      "default": true
+    },
     "testerOffline": {
       "type": "boolean",
       "title": "Run the tester without network",
