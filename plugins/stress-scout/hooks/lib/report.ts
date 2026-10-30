@@ -158,8 +158,8 @@ export type TesterResult = {
 
 const count = (value: unknown): number => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
 
-/** One line of `claude -p --output-format stream-json`: tool calls made, or the final result. */
-export function parseStreamLine(line: string): { toolUses: number; result?: TesterResult } {
+/** One line of `claude -p --output-format stream-json`: tool calls made, the cost it reports so far, or the final result. */
+export function parseStreamLine(line: string): { toolUses: number; cost?: number; result?: TesterResult } {
   let event: unknown
   try {
     event = JSON.parse(line)
@@ -168,15 +168,19 @@ export function parseStreamLine(line: string): { toolUses: number; result?: Test
   }
   if (event === null || typeof event !== 'object') return { toolUses: 0 }
   const record = event as Record<string, unknown>
+  // any event may carry the running cost; a run that ends with no result still spent it
+  const spent = count(record.total_cost_usd)
+  const cost = spent > 0 ? spent : undefined
   if (record.type === 'assistant') {
     const content = (record.message as { content?: unknown } | undefined)?.content
     const blocks = Array.isArray(content) ? (content as { type?: unknown }[]) : []
-    return { toolUses: blocks.filter(block => block.type === 'tool_use').length }
+    return { toolUses: blocks.filter(block => block.type === 'tool_use').length, cost }
   }
-  if (record.type !== 'result') return { toolUses: 0 }
+  if (record.type !== 'result') return { toolUses: 0, cost }
   const usage = (record.usage ?? {}) as Record<string, unknown>
   return {
     toolUses: 0,
+    cost,
     result: {
       text: typeof record.result === 'string' ? record.result : '',
       cost: count(record.total_cost_usd),

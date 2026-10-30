@@ -45,6 +45,7 @@ import {
   renderLedger,
   type Registered,
 } from './lib/discovery'
+import { looksLikeInstruction } from './lib/injection'
 import { vetIdea } from './lib/ideas'
 import { rankCandidates } from './lib/rank'
 import {
@@ -88,6 +89,8 @@ const KEEP_RUNS = 8
 const RERUN_TIMEOUT_MS = 120_000
 /** The statuses a finding's harness is rerun in: its fix may have landed, or may since have broken. */
 const RERUN_STATUSES = new Set<Finding['status']>(['applied', 'fixed', 'regressed'])
+/** A finding stuck in 'handing' (the prompt never entered) goes back to 'new' after this long. */
+const HANDING_TIMEOUT_MS = 10 * 60_000
 const NO_CHANGE = 'no change since the last scan'
 /** Bump when TRIAGE_SYSTEM or the prompt shape changes, so verdicts cached under the old wording are not reused. */
 const TRIAGE_VERSION = 1
@@ -114,6 +117,10 @@ const rateHoldAtom = atom({ plugin: 'stress-scout', key: 'rateHold' } as const, 
 const discoveriesAtom = atom({ plugin: 'stress-scout', key: 'discoveries' } as const, [])
 const discoveryPlanAtom = atom({ plugin: 'stress-scout', key: 'discoveryPlan' } as const, null)
 const discoveriesUsedAtom = atom({ plugin: 'stress-scout', key: 'discoveriesUsed' } as const, 0)
+/** How the tester's commands reach the network, as the last run found it: '' before the first run. */
+const networkAtom = atom({ plugin: 'stress-scout', key: 'network' } as const, '')
+/** Findings whose project moved on since their snapshot, by id, with how: the band and pane offer a re-test. */
+const staleAtom = atom({ plugin: 'stress-scout', key: 'stale' } as const, {})
 
 type Config = {
   triageModel: string
@@ -129,6 +136,8 @@ type Config = {
   isAutoApplying: boolean
   isOpeningPane: boolean
   maxDollarsPerRun: number
+  /** 0: no cap on what one session spends */
+  maxDollarsPerSession: number
   claudePath: string
   rateLimitPct: number
   testerTimeoutMs: number
@@ -175,6 +184,7 @@ export function configOf(options: PluginOptions): Config {
     isAutoApplying: options.autoApplyVerifiedFixes !== false,
     isOpeningPane: options.openPaneOnStart !== false,
     maxDollarsPerRun: numberOf(options.maxDollarsPerRun, 2, 0.05, 100),
+    maxDollarsPerSession: numberOf(options.maxDollarsPerSession, 15, 0, 100_000),
     claudePath: typeof options.claudePath === 'string' ? options.claudePath.trim() : '',
     rateLimitPct: numberOf(options.pauseAtRateLimitPercent, 80, 1, 101),
     testerTimeoutMs: numberOf(options.testerTimeoutMinutes, 20, 2, 120) * 60_000,
@@ -233,9 +243,19 @@ const live = {
   rerunning: new Set<number>(),
   /** Findings whose harness has been rerun since they were handed over. */
   rerun: new Set<number>(),
+  /** When each finding entered 'handing': one that never reports back returns to 'new'. */
+  handingAt: new Map<number, number>(),
+  /** The guard-only fallback has been toasted this session. */
+  isNetworkWarned: false,
+  /** Findings already logged as held back from automatic hand-over. */
+  heldBack: new Set<number>(),
 }
 
 const PRIORITY: Record<Trigger, number> = { manual: 4, change: 3, idle: 2, sweep: 1 }
+
+/** `record` without id `id`. */
+const omitId = (record: Record<number, string>, id: number): Record<number, string> =>
+  Object.fromEntries(Object.entries(record).filter(([key]) => Number(key) !== id))
 
 const unique = (values: readonly string[]): string[] => [...new Set(values.filter(value => value !== ''))]
 
@@ -294,11 +314,12 @@ async function log($: $, text: string): Promise<void> {
 }
 
 async function refreshStatus($: $): Promise<void> {
-  const [phase, paused, runsUsed, rateHold] = await Promise.all([
+  const [phase, paused, runsUsed, rateHold, network] = await Promise.all([
     read($, phaseAtom),
     read($, pausedAtom),
     read($, runsUsedAtom),
     read($, rateHoldAtom),
+    read($, networkAtom),
   ])
   const { maxRuns } = live.config
   const text =
@@ -315,7 +336,8 @@ async function refreshStatus($: $): Promise<void> {
             : runsUsed >= maxRuns
               ? `stress-scout ✓ watching · run cap ${runsUsed}/${maxRuns} reached (/stress still works)`
               : `stress-scout ✓ watching · ${runsUsed}/${maxRuns} runs`
-  $.ui.status(text)
+  // only a network mode the person might not expect is worth the line: the fallback and Windows
+  $.ui.status(network.startsWith('off') || network === '' ? text : `${text} · network: ${network}`)
 }
 
 async function setPhase($: $, kind: Phase['kind'], detail = ''): Promise<void> {
@@ -405,14 +427,48 @@ async function saveMemory($: $, c: Ctx, memory: Memory): Promise<void> {
     tested: newest(memory.tested, 200),
     dismissed: newest(memory.dismissed, 200),
   })
-  const keys = (await $.store.keys()).filter(key => key.startsWith('mem:'))
-  if (keys.length <= 40) return
+  await pruneProjects($, 'mem:', value => (isMemory(value) ? value.touchedAt : 0))
+}
+
+/** The most projects whose stored memory, triage verdicts and discovery ledger are kept; the least recently touched go first. */
+const KEEP_PROJECTS = 40
+
+async function pruneProjects($: $, prefix: string, touchedOf: (value: unknown) => number): Promise<void> {
+  const keys = (await $.store.keys()).filter(key => key.startsWith(prefix))
+  if (keys.length <= KEEP_PROJECTS) return
   const ages: { key: string; at: number }[] = []
-  for (const key of keys) {
-    const value = await $.store.get(key)
-    ages.push({ key, at: isMemory(value) ? value.touchedAt : 0 })
+  for (const key of keys) ages.push({ key, at: touchedOf(await $.store.get(key)) })
+  for (const { key } of ages.sort((a, b) => a.at - b.at).slice(0, keys.length - KEEP_PROJECTS)) await $.store.delete(key)
+}
+
+/** When a stored triage cache last had a verdict added. */
+const triageTouched = (value: unknown): number =>
+  value !== null && typeof value === 'object'
+    ? Math.max(0, ...Object.values(value as TriageCache).map(entry => (typeof entry?.at === 'number' ? entry.at : 0)))
+    : 0
+
+/** When a stored ledger last had an entry added. */
+const ledgerTouched = (value: unknown): number => {
+  const entries = value !== null && typeof value === 'object' ? (value as { entries?: unknown }).entries : undefined
+  return Array.isArray(entries) ? Math.max(0, ...entries.map(entry => (typeof (entry as LedgerEntry | undefined)?.at === 'number' ? (entry as LedgerEntry).at : 0))) : 0
+}
+
+const LEDGER_ENTRY_MAX = 6_000
+
+/** A ledger entry that fits LEDGER_ENTRY_MAX characters: the full discovery first, then a slimmer one, then none. */
+function slimEntry(entry: LedgerEntry): LedgerEntry {
+  const size = (e: LedgerEntry): number => JSON.stringify(e).length
+  if (size(entry) <= LEDGER_ENTRY_MAX) return entry
+  const d = entry.discovery
+  const slim: LedgerEntry = {
+    ...entry,
+    headline: clip(entry.headline, 300),
+    discovery:
+      d === null
+        ? null
+        : { ...d, method: clip(d.method, 400), hypotheses: d.hypotheses.slice(0, 4), numbers: d.numbers.slice(0, 8), sources: d.sources.slice(0, 6), wouldChange: clip(d.wouldChange, 200) },
   }
-  for (const { key } of ages.sort((a, b) => a.at - b.at).slice(0, keys.length - 40)) await $.store.delete(key)
+  return size(slim) <= LEDGER_ENTRY_MAX ? slim : { ...slim, discovery: null }
 }
 
 // ---- the discovery ledger: what this project has asked, answered or given up on ---------
@@ -431,8 +487,9 @@ async function syncLedger($: $, c: Ctx): Promise<void> {
 }
 
 async function saveLedger($: $, c: Ctx, entries: LedgerEntry[]): Promise<void> {
-  const kept = entries.slice(0, 100)
+  const kept = entries.slice(0, 100).map(slimEntry)
   await $.store.set(ledgerKeyOf(c), { v: 1, entries: kept })
+  await pruneProjects($, 'disc:', ledgerTouched)
   await update($, discoveriesAtom, () => kept.slice(0, 20))
 }
 
@@ -605,6 +662,7 @@ async function triage(
   const cache = { ...(await loadTriageCache($, c)), [key]: { at: now, plan } }
   const fresh = Object.fromEntries(Object.entries(cache).filter(([, entry]) => now - entry.at < TRIAGE_CACHE_MAX_AGE_MS))
   await $.store.set(triageCacheKeyOf(c), newest(fresh, TRIAGE_CACHE_KEEP))
+  await pruneProjects($, 'triage:', triageTouched)
   return { plan, tokens }
 }
 
@@ -750,6 +808,8 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string, offline: 
     ...(isPlan ? { ANTHROPIC_API_KEY: '' } : {}),
   }
   let result: TesterResult | undefined
+  /** the highest cost the stream reported: what a run that never reaches its result still spent */
+  let spent = 0
   let steps = 0
   let stderrTail = ''
   let failure = ''
@@ -784,6 +844,7 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string, offline: 
       }
       const event = parseStreamLine(line)
       if (event.result !== undefined) result = event.result
+      spent = Math.max(spent, event.cost ?? 0)
       if (event.toolUses === 0) return
       const before = steps
       steps += event.toolUses
@@ -842,7 +903,7 @@ async function superviseTester($: $, c: Ctx, run: Run, prompt: string, offline: 
     const last = await $.fs.read(hypothesesPath).catch(() => seen?.text ?? '')
     registered = { ...seen, finalHash: fnv(last) }
   }
-  await finishRun($, run, { answer: result?.text ?? '', cost: result?.cost ?? 0, tokens: result?.tokens ?? 0, failure, steps, registered })
+  await finishRun($, run, { answer: result?.text ?? '', cost: Math.max(result?.cost ?? 0, spent), tokens: result?.tokens ?? 0, failure, steps, registered })
 }
 
 type StartArgs = {
@@ -939,7 +1000,15 @@ async function startRun($: $, c: Ctx, args: StartArgs): Promise<void> {
         })
   // the claude process itself needs the API; only the commands it runs lose the network
   const offline = live.config.isOffline ? await probeOffline($, c.isWindows).catch(() => '' as const) : ''
-  await log($, `#${args.id} network: ${offline === '' ? 'guard only' : `off (${offline})`}`)
+  const network = c.isWindows ? 'on (Windows)' : offline === '' ? 'guard only' : `off (${offline})`
+  await log($, `#${args.id} network: ${network}`)
+  await update($, networkAtom, () => network)
+  // an offline tool that should be here but is not: said where it is seen, once
+  if (live.config.isOffline && !c.isWindows && offline === '' && !live.isNetworkWarned) {
+    live.isNetworkWarned = true
+    $.ui.toast('stress-scout: no offline tool works here (sandbox-exec or unshare), so the tester\'s commands keep network access and only the guard limits them', { timeoutMs: 10_000 })
+  }
+  await refreshStatus($)
   void superviseTester($, c, run, prompt, offline)
 }
 
@@ -1018,6 +1087,8 @@ async function tryIdea($: $, id: number): Promise<string> {
   if (idea === undefined) return `No idea #${id}.`
   if (idea.status === 'dismissed') return `Idea #${id} was dismissed.`
   if (idea.status === 'trying') return `Idea #${id} is already being tried.`
+  const capped = await capText($, live.config.maxDollarsPerRun)
+  if (capped !== '') return `Idea #${id} was not tried: ${capped}.`
   await setIdeaStatus($, id, 'trying')
   await update($, seenAtom, seen => Math.max(seen, id))
   $.clock.after(0, () => void kick($, 'manual', idea.title, id))
@@ -1027,9 +1098,27 @@ async function tryIdea($: $, id: number): Promise<string> {
     : `Trying idea #${id} in the sandbox. The result lands in /stress show.`
 }
 
+/** Why the next test would pass maxDollarsPerSession (what is spent plus what the test may cost); '' when it may start. */
+async function capText($: $, budget: number): Promise<string> {
+  const cap = live.config.maxDollarsPerSession
+  if (cap === 0) return ''
+  const spent = await read($, dollarsAtom)
+  return spent + budget <= cap
+    ? ''
+    : `the session dollar cap would be passed (${dollars(spent)} spent, up to ${dollars(budget)} more for one test, cap ${dollars(cap)}); raise maxDollarsPerSession in the plugin settings (0 = no cap)`
+}
+
 async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
   const { config } = live
   const isManual = trigger === 'manual'
+  const capped = await capText($, config.maxDollarsPerRun)
+  if (capped !== '') {
+    // an automatic trigger repeats every few minutes: say it once
+    if (isManual || (await read($, waitingAtom)) !== `paused: ${capped}`) await log($, `${trigger}: skipped, ${capped}`)
+    if (isManual) $.ui.toast(`stress-scout: ${capped}`, { timeoutMs: 8000 })
+    else await update($, waitingAtom, () => `paused: ${capped}`)
+    return
+  }
   if (!isManual) {
     if (await read($, pausedAtom)) return
     if ((await read($, runsUsedAtom)) >= config.maxRuns) return
@@ -1125,17 +1214,21 @@ async function cycle($: $, trigger: Trigger, focus?: string, ideaId?: number): P
   await startRun($, c, { id, trigger: kind, plan, tokens, intent, tree, diff, memoryKey, hash, idea })
 }
 
-async function kick($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
-  if (live.isCycling || (await read($, runAtom)) !== null) {
-    if (live.pending === undefined || PRIORITY[trigger] > PRIORITY[live.pending]) live.pending = trigger
-    if (focus !== undefined) {
-      live.pendingFocus = focus
-      live.pendingIdea = ideaId
-    }
-    return
+/** Holds a trigger until the running cycle or test is over. */
+function queue(trigger: Trigger, focus?: string, ideaId?: number): void {
+  if (live.pending === undefined || PRIORITY[trigger] > PRIORITY[live.pending]) live.pending = trigger
+  if (focus !== undefined) {
+    live.pendingFocus = focus
+    live.pendingIdea = ideaId
   }
+}
+
+async function kick($: $, trigger: Trigger, focus?: string, ideaId?: number): Promise<void> {
+  // the lock is taken before the first await: two triggers in one tick must not both pass the checks below
+  if (live.isCycling) return queue(trigger, focus, ideaId)
   live.isCycling = true
   try {
+    if ((await read($, runAtom)) !== null) return queue(trigger, focus, ideaId)
     await cycle($, trigger, focus, ideaId)
   } catch (error) {
     await log($, `${trigger}: ${messageOf(error)}`)
@@ -1170,14 +1263,21 @@ async function cleanupRuns($: $, c: Ctx): Promise<void> {
     .reverse()
   for (const name of names.slice(KEEP_RUNS)) {
     const path = `${dir}/${name}`
-    if (active?.runDir !== path) await removeTree($, path, c.isWindows, 120_000).catch(() => undefined)
+    if (active?.runDir === path) continue
+    const isGone = await removeTree($, path, c.isWindows, 120_000).catch(async (error: unknown) => {
+      await log($, `could not remove the old run folder ${path}: ${messageOf(error)}`)
+      return true
+    })
+    if (!isGone) await log($, `could not remove the old run folder ${path}; it stays in the scratch folder`)
   }
 }
 
 async function maybeSuggest($: $): Promise<void> {
   if (live.isMainBusy) return
   const [findings, suggested] = await Promise.all([read($, findingsAtom), read($, suggestedAtom)])
-  const pending = findings.filter(f => f.status === 'new' && isActionable(f.verdict) && f.patch !== '')
+  const waiting = findings.filter(f => f.status === 'new' && isActionable(f.verdict))
+  await markStale($, waiting)
+  const pending = waiting.filter(f => f.patch !== '')
   // a verified fix is handed over even when a newer, unverified one waits for approval
   const verified = pending.find(f => f.isVerified)
   if (live.config.isAutoApplying && verified !== undefined) armAutoApply($, verified.id)
@@ -1197,10 +1297,26 @@ function armAutoApply($: $, id: number): void {
   })
 }
 
+/** A fix that may go to Claude with no one pressing Apply: from a plain run, and its text reads as description. */
+const isSafeToAutoApply = (f: Finding): boolean =>
+  f.fromIdea === 0 &&
+  f.discovery === null &&
+  !looksLikeInstruction(f.headline, f.evidence, f.nextStep, f.target, f.fixSummary, f.fixExplanation, f.before, f.after, f.rerun)
+
 async function autoApply($: $, id: number): Promise<void> {
   if (live.isMainBusy || (await read($, pausedAtom))) return
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
   if (finding === undefined || finding.status !== 'new') return
+  const holdBack = async (why: string): Promise<void> => {
+    if (!live.heldBack.has(id)) await log($, `#${id}: not handed to Claude automatically, ${why}`)
+    live.heldBack.add(id)
+  }
+  if (!isSafeToAutoApply(finding)) return holdBack(finding.fromIdea > 0 || finding.discovery !== null ? 'it comes from an idea or a discovery' : 'its report contains instruction-like text')
+  const drift = await driftOf($, finding)
+  await update($, staleAtom, stale => (drift.isStale ? { ...stale, [id]: drift.note } : omitId(stale, id)))
+  if (drift.isStale) return holdBack('the project changed since the snapshot; re-test first')
+  // the drift check awaited: another press may have handed it over meanwhile
+  if ((await read($, findingsAtom)).find(f => f.id === id)?.status !== 'new') return
   await log($, `#${id}: verified fix handed to Claude automatically`)
   $.ui.toast(`stress-scout is handing verified fix #${id} to Claude`, { timeoutMs: 8000 })
   await setStatus($, id, 'handing')
@@ -1260,7 +1376,15 @@ async function finishRun($: $, run: Run, outcome: Outcome): Promise<void> {
   }
   // the files the fix touches, as the snapshot held them: the handoff checks them against the project then
   const targeted = report?.fix?.files.length ? report.fix.files : [(report?.target || run.target).replace(/:.*$/, '')]
-  const files = c !== undefined ? await blobsOf($, c.shadow, run.baseTree, targeted).catch(() => new Map<string, string>()) : new Map<string, string>()
+  let files = new Map<string, string>()
+  if (c !== undefined) {
+    try {
+      files = await blobsOf($, c.shadow, run.baseTree, targeted)
+    } catch (error) {
+      // without them the finding has no origin files, and a later hand-over cannot tell the code has moved on
+      await log($, `#${run.id}: could not record the files the fix targets (${targeted.join(', ')}): ${messageOf(error)}`)
+    }
+  }
   const patchPath = patch !== '' ? `${run.runDir}/fix.patch` : ''
   if (patchPath !== '') await $.fs.write(patchPath, `${patch}\n`)
   const finding: Finding = {
@@ -1455,16 +1579,23 @@ async function proposeDiscovery($: $, question: string, idea?: Idea, isHeld = fa
 /** Starts a discovery that was approved (the press, or discoverWhenIdle). `isHeld`: the caller is already inside a cycle. */
 async function runDiscovery($: $, plan: DiscoveryPlan, isHeld = false): Promise<string> {
   const { config } = live
-  if (!isHeld && (live.isCycling || (await read($, runAtom)) !== null)) {
+  const busy = async (): Promise<string> => {
     await update($, discoveryPlanAtom, () => plan)
     return 'A test is running. Press Run it again when it has finished; the plan is kept.'
   }
-  const used = await read($, discoveriesUsedAtom)
-  if (used >= config.maxDiscoveries) return `This session's discovery cap is reached (${used}/${config.maxDiscoveries}).`
-  const full = await fullWindow($)
-  if (full !== undefined) return `Your ${full.name} is at or above ${config.rateLimitPct}%, so the discovery waits.`
-  if (!isHeld) live.isCycling = true
+  // as in kick, the lock comes before the first await
+  if (!isHeld) {
+    if (live.isCycling) return busy()
+    live.isCycling = true
+  }
   try {
+    if (!isHeld && (await read($, runAtom)) !== null) return busy()
+    const used = await read($, discoveriesUsedAtom)
+    if (used >= config.maxDiscoveries) return `This session's discovery cap is reached (${used}/${config.maxDiscoveries}).`
+    const full = await fullWindow($)
+    if (full !== undefined) return `Your ${full.name} is at or above ${config.rateLimitPct}%, so the discovery waits.`
+    const capped = await capText($, config.maxDollarsPerDiscovery)
+    if (capped !== '') return `No discovery started: ${capped}.`
     const c = await ensureCtx($)
     if (c === undefined) return `stress-scout is off: ${live.ctxError}`
     const tree = await currentTree($, c)
@@ -1598,7 +1729,7 @@ async function finishDiscovery($: $, run: Run, outcome: Outcome): Promise<void> 
     }
     const entries = [entry, ...(await loadLedger($, c)).filter(e => e.key !== entry.key)]
     await saveLedger($, c, entries)
-    await $.fs.write(`${run.snapshot}/.stress-scout/discoveries.md`, renderLedger(entries)).catch(() => undefined)
+    await $.fs.write(`${run.snapshot}/.stress-scout/discoveries.md`, renderLedger(entries)).catch(error => log($, `#${run.id}: could not write discoveries.md: ${messageOf(error)}`))
     // a result that implies a change becomes one idea, which /stress try can build and measure
     if (report?.change !== undefined && !isPartial) {
       const draft: IdeaDraft = { ...report.change, value: 10, type: report.change.type === 'feature' ? 'feature' : 'refinement' }
@@ -1642,9 +1773,22 @@ function armIdle($: $): void {
   })
 }
 
+/** A handoff that has awaited Claude for HANDING_TIMEOUT_MS is let go: Apply is offered again. */
+async function releaseStuckHandoffs($: $): Promise<void> {
+  const now = await $.clock.now()
+  for (const [id, at] of [...live.handingAt]) {
+    if (now - at < HANDING_TIMEOUT_MS) continue
+    live.handingAt.delete(id)
+    if ((await read($, findingsAtom)).find(f => f.id === id)?.status !== 'handing') continue
+    await log($, `#${id}: the hand-over to Claude has waited ${ago(now - at)} with no answer; Apply is offered again (check the prompt did not already go in)`)
+    await setStatus($, id, 'new')
+  }
+}
+
 /** Once a minute: notice edits made outside Claude (your editor), and sweep when idle. */
 async function heartbeat($: $): Promise<void> {
   const { config } = live
+  await releaseStuckHandoffs($)
   if (live.isCycling || live.quietTimer !== undefined) return
   if ((await read($, runAtom)) !== null || (await read($, pausedAtom))) return
   const c = await ensureCtx($)
@@ -1680,13 +1824,15 @@ async function showPane($: $, id: number): Promise<void> {
   await $.ui.open({ id: PANE, title: 'Stress Scout' })
 }
 
-async function apply($: $, id: number): Promise<string> {
+/** `isNamed`: the person typed this finding's number, which is the only way a dismissed one is handed over. */
+async function apply($: $, id: number, isNamed = false): Promise<string> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
   if (finding === undefined) {
     const isIdea = (await read($, ideasAtom)).some(i => i.id === id)
     return isIdea ? `Idea #${id} is untested: /stress try ${id} builds and checks it first.` : `No finding #${id}.`
   }
   if (finding.patch === '' && finding.nextStep === '') return `Finding #${id} has no fix to hand over.`
+  if (finding.status === 'dismissed' && !isNamed) return `Finding #${id} was dismissed; /stress apply ${id} hands it over anyway.`
   // a regressed fix may be handed over again; one that holds may not
   if (finding.status === 'handing' || finding.status === 'applied' || finding.status === 'fixed') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
   // marked before the handoff is scheduled: the prompt only resolves once Claude is free, and repeat presses must not queue copies
@@ -1697,17 +1843,21 @@ async function apply($: $, id: number): Promise<string> {
 }
 
 const setStatus = async ($: $, id: number, status: Finding['status']): Promise<void> => {
+  if (status === 'handing') live.handingAt.set(id, await $.clock.now())
+  else live.handingAt.delete(id)
   await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status } : f)))
 }
 
 /**
  * What differs between the project now and where the finding was made: a line
- * for the branch or commit, a line for the files the patch touches. '' when nothing does.
+ * for the branch or commit, a line for the files the patch touches. `note` is ''
+ * and `isStale` false when nothing differs; a comparison that could not be made
+ * counts as stale, since nothing says the patch still fits.
  */
-async function driftNote($: $, finding: Finding): Promise<string> {
+async function driftOf($: $, finding: Finding): Promise<{ note: string; isStale: boolean }> {
   const origin = finding.origin
   const c = await ensureCtx($)
-  if (origin === undefined || c === undefined) return ''
+  if (origin === undefined || c === undefined) return { note: '', isStale: false }
   const label = (at: { branch: string; head: string }): string => (at.branch !== '' ? `${at.branch}@${at.head}` : at.head)
   const notes: string[] = []
   const now = await projectHead($, c.root)
@@ -1715,11 +1865,38 @@ async function driftNote($: $, finding: Finding): Promise<string> {
     notes.push(`Made against ${label(origin)}; you're on ${label(now)}.`)
   }
   const paths = Object.keys(origin.files)
-  const current = await worktreeBlobs($, c.shadow, paths).catch(() => undefined)
+  let current: Map<string, string> | undefined
+  try {
+    current = await worktreeBlobs($, c.shadow, paths)
+  } catch (error) {
+    await log($, `#${finding.id}: could not compare the files with the snapshot: ${messageOf(error)}`)
+    notes.push('Could not compare the files with the snapshot, so check the patch against the current code.')
+  }
   // a file gone from the project counts as changed too
   const changed = current === undefined ? [] : paths.filter(path => current.get(path) !== origin.files[path])
   if (changed.length > 0) notes.push(`${changed.join(', ')} ${changed.length === 1 ? 'has' : 'have'} changed since the snapshot.`)
-  return notes.join('\n')
+  return { note: notes.join('\n'), isStale: notes.length > 0 }
+}
+
+const driftNote = async ($: $, finding: Finding): Promise<string> => (await driftOf($, finding)).note
+
+/** Records which waiting fixes the project has moved on from, so the band and pane can offer a re-test. */
+async function markStale($: $, findings: readonly Finding[]): Promise<void> {
+  const next: Record<number, string> = {}
+  for (const f of findings) {
+    const drift = await driftOf($, f).catch(async (error: unknown) => {
+      await log($, `#${f.id}: could not check the project against its snapshot: ${messageOf(error)}`)
+      return { note: '', isStale: false }
+    })
+    if (drift.isStale) next[f.id] = drift.note
+  }
+  await update($, staleAtom, () => next)
+}
+
+/** Runs the finding's target again from the project as it is now (what `/stress <target>` does). */
+async function retest($: $, id: number): Promise<string> {
+  const finding = (await read($, findingsAtom)).find(f => f.id === id)
+  return finding === undefined ? `No finding #${id}.` : runNow($, finding.target)
 }
 
 /** `/stress apply` with no number: the newest finding that has a patch or a next step to hand over. */
@@ -1819,6 +1996,8 @@ async function forget($: $): Promise<string> {
 }
 
 async function runNow($: $, focus?: string): Promise<string> {
+  const capped = await capText($, live.config.maxDollarsPerRun)
+  if (capped !== '') return `Nothing started: ${capped}.`
   const run = await read($, runAtom)
   $.clock.after(0, () => void kick($, 'manual', focus))
   if (run !== null) {
@@ -1859,7 +2038,7 @@ function nextText(waiting: string, runsUsed: number): string {
 
 async function statusText($: $): Promise<string> {
   const { config } = live
-  const [phase, findings, ideas, runsUsed, tokens, spent, paused, run, waiting, plan, discoveries] = await Promise.all([
+  const [phase, findings, ideas, runsUsed, tokens, spent, paused, run, waiting, plan, discoveries, network] = await Promise.all([
     read($, phaseAtom),
     read($, findingsAtom),
     read($, ideasAtom),
@@ -1871,6 +2050,7 @@ async function statusText($: $): Promise<string> {
     read($, waitingAtom),
     read($, discoveryPlanAtom),
     read($, discoveriesAtom),
+    read($, networkAtom),
   ])
   const now = await $.clock.now()
   const state =
@@ -1884,6 +2064,8 @@ async function statusText($: $): Promise<string> {
   const lines = [
     state,
     `automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} and ${compactTokens(tokens)} tokens this session · triage ${config.triageModel}, tester ${config.testerModel}`,
+    ...(network !== '' ? [`network: ${network}`] : []),
+    ...(config.maxDollarsPerSession > 0 ? [`session cap ${dollars(spent)} of ${dollars(config.maxDollarsPerSession)} (maxDollarsPerSession)`] : []),
   ]
   for (const f of findings.slice(0, 6)) {
     const flags = `${f.isVerified ? ' (fix verified)' : ''}${f.fromIdea > 0 ? ` (from idea #${f.fromIdea})` : ''}${f.status !== 'new' ? ` [${f.status}]` : ''}`
@@ -1901,17 +2083,20 @@ async function statusText($: $): Promise<string> {
 }
 
 const HELP = [
-  '/stress            stress-test the latest change now (a sweep when nothing changed; also /stress run or start)',
+  '/stress            stress-test the latest change now (a sweep when nothing changed; also /stress now, run or start)',
   '/stress <focus>    stress-test something specific, e.g. /stress the retry logic in api/client.ts',
-  '/stress show       open the Stress Scout pane',
-  '/stress status     what it is doing and what it found',
-  '/stress apply [N]  hand finding N to Claude (patch and evidence attached); no N: the newest one with a fix',
+  '/stress show       open the Stress Scout pane (also /stress pane)',
+  '/stress status     what it is doing, what it found, what it has spent (the session cap, the network mode)',
+  '/stress apply      hand the newest waiting finding that has a fix to Claude (never a dismissed one)',
+  '/stress apply N    hand finding N to Claude (patch and evidence attached); the only way to apply a dismissed one',
   '/stress dismiss N  drop finding or idea N; it is not raised again unless the code changes',
   '/stress dismiss N all  drop every finding of that kind in finding N\'s file, until the file changes',
-  '/stress try N      build idea N in the sandbox and measure it; the result is a finding that links back to it',
-  '/stress discover Q research a question with hypotheses, measurements and fresh sources; shows a plan, you press Run it',
+  '/stress try N      build idea N (see Ideas in the pane) in the sandbox and measure it; the result is a finding that links back to it',
+  '/stress discover Q research a question with hypotheses, measurements and fresh sources (see Discoveries in the pane); shows a plan, you press Run it',
   '/stress stop       stop the running test',
   '/stress pause | resume | forget',
+  '/stress help       this list',
+  'A test is refused once the session would pass maxDollarsPerSession (default $15; 0 = no cap).',
 ].join('\n')
 
 async function runCommand($: $, args: string): Promise<string> {
@@ -1936,7 +2121,7 @@ async function runCommand($: $, args: string): Promise<string> {
       return stopTester($)
     case 'apply':
       if (rest[0] === undefined || rest[0] === '') return applyNewest($)
-      return Number.isInteger(n) && n > 0 ? apply($, n) : 'Usage: /stress apply [finding number]'
+      return Number.isInteger(n) && n > 0 ? apply($, n, true) : 'Usage: /stress apply [finding number]'
     case 'dismiss':
       if (!Number.isInteger(n) || n <= 0) return 'Usage: /stress dismiss <finding or idea number> [all]'
       return (rest[1] ?? '').toLowerCase() === 'all' ? dismissAll($, n) : dismiss($, n)
@@ -1996,7 +2181,7 @@ async function onMainTurnEnd($: $): Promise<void> {
 async function handoff($: $, id: number): Promise<string | undefined> {
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
   if (finding === undefined) return undefined
-  await update($, findingsAtom, list => list.map(f => (f.id === id ? { ...f, status: 'applied' as const } : f)))
+  await setStatus($, id, 'applied')
   await update($, seenAtom, seen => Math.max(seen, id))
   return handoffContext(finding, await $.clock.now(), 30_000, await driftNote($, finding))
 }
@@ -2092,12 +2277,13 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (live.role === 'tester' || e.props.hasSurvey) return next(e)
-    const [findings, ideas, seenId, runsUsed, plan] = await Promise.all([
+    const [findings, ideas, seenId, runsUsed, plan, stale] = await Promise.all([
       read($, findingsAtom),
       read($, ideasAtom),
       read($, seenAtom),
       read($, runsUsedAtom),
       read($, discoveryPlanAtom),
+      read($, staleAtom),
     ])
     const finding = findings.find(f => f.status === 'new' && isActionable(f.verdict) && f.id > seenId)
     const { Box, Text, Button } = $.ui.resolve(e)
@@ -2167,10 +2353,16 @@ export const register: Register = (on, options) => {
             {budget}
           </Text>
         )}
+        {stale[finding.id] !== undefined && (
+          <Text key="stale" color="warning" wrap="truncate-end" size="footnote">
+            {`re-test first: ${oneLine(stale[finding.id] ?? '')}`}
+          </Text>
+        )}
         <Box flexDirection="row" gap={isGraphical ? 'xs' : 1}>
           {canHandOver(finding) && (
             <Button key="apply" label={handOverLabel(finding)} variant="primary" hotkey="a" onPress={() => void apply($, finding.id)} />
           )}
+          {stale[finding.id] !== undefined && <Button key="retest" label="Re-test" hotkey="t" onPress={() => void retest($, finding.id)} />}
           <Button key="details" label="Details" hotkey="d" onPress={() => void showPane($, finding.id)} />
           <Button key="dismiss" label="Dismiss" hotkey="x" onPress={() => void dismiss($, finding.id)} />
         </Box>
@@ -2183,7 +2375,7 @@ export const register: Register = (on, options) => {
     const { config } = live
     // the terminal keeps its compact rows; a graphical surface (the app, an editor, a phone) gets cards
     const isGraphical = e.surface !== 'terminal'
-    const [phase, findings, ideas, activity, runsUsed, tokens, spent, paused, openId, run, waiting, plan, discoveries, discoveriesUsed] = await Promise.all([
+    const [phase, findings, ideas, activity, runsUsed, tokens, spent, paused, openId, run, waiting, plan, discoveries, discoveriesUsed, stale, network] = await Promise.all([
       read($, phaseAtom),
       read($, findingsAtom),
       read($, ideasAtom),
@@ -2198,6 +2390,8 @@ export const register: Register = (on, options) => {
       read($, discoveryPlanAtom),
       read($, discoveriesAtom),
       read($, discoveriesUsedAtom),
+      read($, staleAtom),
+      read($, networkAtom),
     ])
     const next = phase.kind === 'idle' && !paused ? nextText(waiting, runsUsed) : ''
     // findings grouped under their file; groups run newest first by their newest finding, as the list does
@@ -2250,7 +2444,7 @@ export const register: Register = (on, options) => {
             {`stress-scout · ${state}`}
           </Text>
           <Text dimColor size="footnote" tabular wrap="truncate-end">
-            {`automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)} · ${compactTokens(tokens)} tokens · ${mode}`}
+            {`automatic runs ${runsUsed}/${config.maxRuns} · ${dollars(spent)}${config.maxDollarsPerSession > 0 ? ` of ${dollars(config.maxDollarsPerSession)}` : ''} · ${compactTokens(tokens)} tokens · ${mode}${network !== '' ? ` · network: ${network}` : ''}`}
           </Text>
           {next !== '' && (
             <Text key="next" dimColor size="footnote" wrap="wrap">
@@ -2337,6 +2531,11 @@ export const register: Register = (on, options) => {
                       {`${f.isVerified ? 'verified fix' : 'unverified fix'}: ${f.fixSummary}${delta}`}
                     </Text>
                   )}
+                  {isNew && stale[f.id] !== undefined && (
+                    <Text color="warning" size="footnote" wrap="wrap">
+                      {`re-test first: ${oneLine(stale[f.id] ?? '')}`}
+                    </Text>
+                  )}
                   {isOpen && (
                     <Box flexDirection="column" gap={row}>
                       {f.discovery !== null && discoveryRows(f.discovery)}
@@ -2357,6 +2556,9 @@ export const register: Register = (on, options) => {
                   <Box flexDirection="row" gap={row}>
                     {isNew && canHandOver(f) && (
                       <Button key={`apply-${f.id}`} label={handOverLabel(f)} variant="primary" onPress={() => void apply($, f.id)} />
+                    )}
+                    {isNew && stale[f.id] !== undefined && (
+                      <Button key={`retest-${f.id}`} label="Re-test" onPress={() => void retest($, f.id)} />
                     )}
                     <Button key={`open-${f.id}`} label={isOpen ? 'Less' : 'Details'} onPress={() => void showPane($, f.id)} />
                     {isNew && <Button key={`dismiss-${f.id}`} label="Dismiss" onPress={() => void dismiss($, f.id)} />}
