@@ -182,7 +182,7 @@ export function configOf(options: PluginOptions): Config {
     isSuggesting: options.suggestImprovements !== false,
     maxIdeas: numberOf(options.maxIdeasPerSession, 5, 0, 100),
     isReadingSources: options.discoverSources !== false,
-    isDiscoveringWhenIdle: options.discoverWhenIdle === true,
+    isDiscoveringWhenIdle: options.discoverWhenIdle !== false,
     maxDollarsPerDiscovery: numberOf(options.maxDollarsPerDiscovery, 5, 0.05, 100),
     maxDiscoveries: numberOf(options.maxDiscoveriesPerSession, 2, 0, 50),
   }

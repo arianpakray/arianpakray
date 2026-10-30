@@ -1712,7 +1712,7 @@ describe('discovery scout', () => {
     return pane
   }
 
-  test('hypotheses are stored before the experiment starts, and the finding says so', { timeoutMs: 30_000 }, async ($, on) => {
+  test('hypotheses are stored before the experiment starts, and the finding says so', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1769,7 +1769,7 @@ describe('discovery scout', () => {
     },
   ]
   for (const scenario of unregistered) {
-    test(`a report is marked not pre-registered when ${scenario.name}`, { timeoutMs: 30_000 }, async ($, on) => {
+    test(`a report is marked not pre-registered when ${scenario.name}`, { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
       const clock = mock.clock(on, { now: 1_700_000_000_000 })
       const w = world(on)
       w.steps = scenario.steps(w)
@@ -1784,7 +1784,7 @@ describe('discovery scout', () => {
     })
   }
 
-  test('an over-budget run stops and records a partial result', { timeoutMs: 30_000, options: { maxDollarsPerDiscovery: 3 } }, async ($, on) => {
+  test('an over-budget run stops and records a partial result', { timeoutMs: 30_000, options: { discoverWhenIdle: false, maxDollarsPerDiscovery: 3 } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1810,7 +1810,7 @@ describe('discovery scout', () => {
     expect(again.text).toContain('Discovery plan for:')
   })
 
-  test('a discovery stops at the rate-limit threshold and records a partial result', { timeoutMs: 30_000 }, async ($, on) => {
+  test('a discovery stops at the rate-limit threshold and records a partial result', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     w.steps = [() => (w.rateLimits = [{ kind: 'five_hour', percentUsed: 85 }]), BASH, BASH, BASH, BASH, BASH, BASH]
@@ -1820,7 +1820,7 @@ describe('discovery scout', () => {
     expect(status.text).toContain('partial: stopped: your 5-hour usage window reached 80%')
   })
 
-  test('a repeated question at unchanged code is answered from the ledger: no spawn, no model call', { timeoutMs: 30_000 }, async ($, on) => {
+  test('a repeated question at unchanged code is answered from the ledger: no spawn, no model call', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1853,7 +1853,7 @@ describe('discovery scout', () => {
     expect(w.spawned).toHaveLength(1)
   })
 
-  test('the ledger keeps every question, dead ends included, and is appended to discoveries.md', { timeoutMs: 30_000 }, async ($, on) => {
+  test('the ledger keeps every question, dead ends included, and is appended to discoveries.md', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1871,7 +1871,7 @@ describe('discovery scout', () => {
     await pane.unmount()
   })
 
-  test('a surprising result is flagged and ranked first', { timeoutMs: 30_000 }, async ($, on) => {
+  test('a surprising result is flagged and ranked first', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1887,7 +1887,7 @@ describe('discovery scout', () => {
     expect(w.toasts.some(t => t.includes('discovery #1 (surprising)'))).toBe(true)
   })
 
-  test('text from a source that gives instructions changes nothing the scout does', { timeoutMs: 30_000, options: { sweepWhenIdle: false } }, async ($, on) => {
+  test('text from a source that gives instructions changes nothing the scout does', { timeoutMs: 30_000, options: { discoverWhenIdle: false, sweepWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     w.triage = JSON.stringify({ worth: false, risk: 'low', target: '', skip: 'nothing to test' })
@@ -1927,7 +1927,7 @@ describe('discovery scout', () => {
     expect(w.submitted).toHaveLength(0)
   })
 
-  test('a discovery that implies a change creates exactly one Ideas entry, which /stress try can verify', { timeoutMs: 30_000 }, async ($, on) => {
+  test('a discovery that implies a change creates exactly one Ideas entry, which /stress try can verify', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1947,7 +1947,7 @@ describe('discovery scout', () => {
     expect(w.spawned[1]?.input).toContain('IMPROVEMENT TO TRY (idea #2, size S; not a bug hunt): Evict from a linked list')
   })
 
-  test('an implied change that adds a dependency creates no idea', { timeoutMs: 30_000 }, async ($, on) => {
+  test('an implied change that adds a dependency creates no idea', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -1957,7 +1957,7 @@ describe('discovery scout', () => {
     expect((await $.command.run(stress('status') as never)).text ?? '').not.toContain('idea #')
   })
 
-  test('the plan waits for a press: nothing runs, nothing is spent, and Cancel drops it', { timeoutMs: 30_000, options: { sweepWhenIdle: false } }, async ($, on) => {
+  test('the plan waits for a press: nothing runs, nothing is spent, and Cancel drops it', { timeoutMs: 30_000, options: { discoverWhenIdle: false, sweepWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     w.triage = JSON.stringify({ worth: false, risk: 'low', target: '', skip: 'nothing to test' })
@@ -1990,7 +1990,7 @@ describe('discovery scout', () => {
     expect(w.spawned).toHaveLength(0)
   })
 
-  test('the band button runs the plan too', { timeoutMs: 30_000 }, async ($, on) => {
+  test('the band button runs the plan too', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -2003,7 +2003,7 @@ describe('discovery scout', () => {
     expect(w.spawned).toHaveLength(1)
   })
 
-  test('with maxDiscoveriesPerSession 0 discovery is off: no plan, no run', { timeoutMs: 30_000, options: { maxDiscoveriesPerSession: 0, sweepWhenIdle: false } }, async ($, on) => {
+  test('with maxDiscoveriesPerSession 0 discovery is off: no plan, no run', { timeoutMs: 30_000, options: { discoverWhenIdle: false, maxDiscoveriesPerSession: 0, sweepWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     w.triage = JSON.stringify({ worth: false, risk: 'low', target: '', skip: 'nothing to test' })
@@ -2019,7 +2019,7 @@ describe('discovery scout', () => {
     await pane.unmount()
   })
 
-  test('maxDiscoveriesPerSession caps how many start', { timeoutMs: 30_000, options: { maxDiscoveriesPerSession: 1 } }, async ($, on) => {
+  test('maxDiscoveriesPerSession caps how many start', { timeoutMs: 30_000, options: { discoverWhenIdle: false, maxDiscoveriesPerSession: 1 } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     registersFirst(w)
@@ -2030,7 +2030,7 @@ describe('discovery scout', () => {
     expect(w.spawned).toHaveLength(1)
   })
 
-  test('a discovery waits while the rate-limit window is full', { timeoutMs: 30_000 }, async ($, on) => {
+  test('a discovery waits while the rate-limit window is full', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
     const clock = mock.clock(on, { now: 1_700_000_000_000 })
     const w = world(on)
     await $.session.start({ cwd: ROOT, surface: 'desktop', isInteractive: true })
@@ -2077,7 +2077,7 @@ describe('discovery scout', () => {
       await clock.settle()
     }
 
-    test('Research this plans a discovery from the idea, and the press runs it', { timeoutMs: 30_000 }, async ($, on) => {
+    test('Research this plans a discovery from the idea, and the press runs it', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
       const { clock, w } = await withIdea($, on)
       const pane = await paneOf($)
       expect(await pane.find({ key: 'research-1' })).toBeDefined()
@@ -2107,7 +2107,15 @@ describe('discovery scout', () => {
       expect(w.spawned).toHaveLength(1)
     })
 
-    test('by default an idle session starts no discovery', { timeoutMs: 30_000, options: { sweepWhenIdle: false } }, async ($, on) => {
+    test('by default an idle session researches the newest idea', { timeoutMs: 30_000, options: { sweepWhenIdle: false, tryIdeasWhenIdle: false } }, async ($, on) => {
+      const { clock, w } = await withIdea($, on)
+      registersFirst(w)
+      await sitIdle($, clock)
+      expect(w.spawned).toHaveLength(1)
+      expect(w.spawned[0]?.input).toContain('QUESTION: Does this pay off in this codebase: Show the eviction count')
+    })
+
+    test('with discoverWhenIdle off an idle session starts no discovery', { timeoutMs: 30_000, options: { discoverWhenIdle: false, sweepWhenIdle: false } }, async ($, on) => {
       const { clock, w } = await withIdea($, on)
       await sitIdle($, clock)
       await clock.advance(10 * 60_000)
@@ -2122,7 +2130,7 @@ describe('discovery scout', () => {
   describe('fresh sources', () => {
     const argvOf = (w: World): string => (w.spawned[0]?.argv ?? []).join(' ')
 
-    test('a discovery run may use the web tools; a stress test never does', { timeoutMs: 30_000 }, async ($, on) => {
+    test('a discovery run may use the web tools; a stress test never does', { timeoutMs: 30_000, options: { discoverWhenIdle: false } }, async ($, on) => {
       const clock = mock.clock(on, { now: 1_700_000_000_000 })
       const w = world(on)
       registersFirst(w)
@@ -2138,7 +2146,7 @@ describe('discovery scout', () => {
       expect(w.spawned[1]?.env?.STRESS_SCOUT_WEB).toBeUndefined()
     })
 
-    test('discoverSources off keeps the web tools out', { timeoutMs: 30_000, options: { discoverSources: false } }, async ($, on) => {
+    test('discoverSources off keeps the web tools out', { timeoutMs: 30_000, options: { discoverWhenIdle: false, discoverSources: false } }, async ($, on) => {
       const clock = mock.clock(on, { now: 1_700_000_000_000 })
       const w = world(on)
       registersFirst(w)

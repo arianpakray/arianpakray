@@ -112,8 +112,8 @@
     "discoverWhenIdle": {
       "type": "boolean",
       "title": "Research an idea when idle",
-      "description": "When nothing else is due, research the newest idea without waiting for Run it. Off: a discovery only starts when you press Run it.",
-      "default": false
+      "description": "On by default: when nothing else is due, research the newest idea without waiting for Run it. Off: a discovery only starts when you press Run it.",
+      "default": true
     },
     "maxDollarsPerDiscovery": {
       "type": "number",
