@@ -98,4 +98,4 @@ bun ci/offline-harness.ts  # curl, run through the offline wrapper, reaches loop
 bun ci/docs-check.ts       # every /stress command is in /stress help and the table above
 ```
 
-CI runs the validate, test, `ci/real-fs.ts` and `ci/docs-check.ts` steps on Ubuntu, macOS and Windows, and the guard and offline harnesses on Ubuntu and macOS. The guard is only unit-tested on Windows (`tests/windows.test.ts`): `ci/guard-harness.ts` needs a bash that runs `bash -c` cases, and nothing here has run it under Git Bash.
+CI runs the validate, test, `ci/real-fs.ts` and `ci/docs-check.ts` steps on Ubuntu, macOS and Windows, and the guard and offline harnesses on Ubuntu and macOS. The guard is only unit-tested on Windows (`tests/windows.test.ts`). CI also tries `ci/guard-harness.ts` under Git Bash there, as an advisory step that cannot fail the build, because nothing has yet shown that bash.exe passes the harness's quoting through intact; until that step has gone green, treat the guard as unproven against real bash on Windows.
