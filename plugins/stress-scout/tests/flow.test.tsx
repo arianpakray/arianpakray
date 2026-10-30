@@ -2555,24 +2555,24 @@ describe('0.4.2: what the tester writes is data, and a run is bounded by what it
   })
 
   describe('a hand-over that is stuck', () => {
-    test('returns to new after ten minutes, and can be applied again', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
+    test('says so after ten minutes, and never queues a second copy while the first is still waiting', { timeoutMs: 30_000, options: { autoApplyVerifiedFixes: false } }, async ($, on) => {
       const { clock, w } = await firstRun($, on)
       let release = () => {}
       w.submitGate = new Promise<void>(resolve => (release = resolve))
       expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
       await clock.settle()
-      await clock.advance(9 * 60_000)
+      await clock.advance(11 * 60_000)
       await clock.settle()
+      // the prompt is queued behind a long turn, not lost: it stays handed over
       expect((await $.command.run(stress('status') as never)).text).toContain('[handing]')
-      await clock.advance(2 * 60_000)
-      await clock.settle()
-      expect((await $.command.run(stress('status') as never)).text).not.toContain('[handing]')
       const pane = await paneOf($)
-      expect(await textsOf(pane, /#1: the hand-over to Claude has waited 10m/)).toHaveLength(1)
+      expect(await textsOf(pane, /#1: the hand-over has waited 1\dm; its prompt is still queued/)).toHaveLength(1)
       await pane.unmount()
-      expect((await $.command.run(stress('apply 1') as never)).text).toBe('Handing finding #1 to Claude.')
+      expect((await $.command.run(stress('apply 1') as never)).text).toBe('Finding #1 is already being handed to Claude.')
       release()
       await clock.settle()
+      expect(w.submitted).toHaveLength(1)
+      expect((await $.command.run(stress('status') as never)).text).toContain('[applied]')
     })
   })
 

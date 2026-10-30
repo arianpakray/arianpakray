@@ -245,6 +245,8 @@ const live = {
   rerun: new Set<number>(),
   /** When each finding entered 'handing': one that never reports back returns to 'new'. */
   handingAt: new Map<number, number>(),
+  /** hand-offs whose prompt.submit has not settled in this module: still queued, so never offered again */
+  inFlight: new Set<number>(),
   /** The guard-only fallback has been toasted this session. */
   isNetworkWarned: false,
   /** Findings already logged as held back from automatic hand-over. */
@@ -1306,7 +1308,7 @@ const isSafeToAutoApply = (f: Finding): boolean =>
 async function autoApply($: $, id: number): Promise<void> {
   if (live.isMainBusy || (await read($, pausedAtom))) return
   const finding = (await read($, findingsAtom)).find(f => f.id === id)
-  if (finding === undefined || finding.status !== 'new') return
+  if (finding === undefined || finding.status !== 'new' || live.inFlight.has(id)) return
   const holdBack = async (why: string): Promise<void> => {
     if (!live.heldBack.has(id)) await log($, `#${id}: not handed to Claude automatically, ${why}`)
     live.heldBack.add(id)
@@ -1773,13 +1775,20 @@ function armIdle($: $): void {
   })
 }
 
-/** A handoff that has awaited Claude for HANDING_TIMEOUT_MS is let go: Apply is offered again. */
+/**
+ * A handoff that has awaited Claude for HANDING_TIMEOUT_MS: one whose prompt is still queued is
+ * left alone and said so (a second copy would apply the fix twice); one this module lost is let go.
+ */
 async function releaseStuckHandoffs($: $): Promise<void> {
   const now = await $.clock.now()
   for (const [id, at] of [...live.handingAt]) {
     if (now - at < HANDING_TIMEOUT_MS) continue
     live.handingAt.delete(id)
     if ((await read($, findingsAtom)).find(f => f.id === id)?.status !== 'handing') continue
+    if (live.inFlight.has(id)) {
+      await log($, `#${id}: the hand-over has waited ${ago(now - at)}; its prompt is still queued and goes in once Claude is free`)
+      continue
+    }
     await log($, `#${id}: the hand-over to Claude has waited ${ago(now - at)} with no answer; Apply is offered again (check the prompt did not already go in)`)
     await setStatus($, id, 'new')
   }
@@ -1835,6 +1844,7 @@ async function apply($: $, id: number, isNamed = false): Promise<string> {
   if (finding.status === 'dismissed' && !isNamed) return `Finding #${id} was dismissed; /stress apply ${id} hands it over anyway.`
   // a regressed fix may be handed over again; one that holds may not
   if (finding.status === 'handing' || finding.status === 'applied' || finding.status === 'fixed') return `Finding #${id} is already ${finding.status === 'handing' ? 'being handed' : 'handed'} to Claude.`
+  if (live.inFlight.has(id)) return `Finding #${id}'s hand-over is still queued; it goes in once Claude is free.`
   // marked before the handoff is scheduled: the prompt only resolves once Claude is free, and repeat presses must not queue copies
   await setStatus($, id, 'handing')
   // /stress apply's hook holds the turn a submitted prompt waits on: hand over once the command has answered
@@ -1909,6 +1919,7 @@ async function applyNewest($: $): Promise<string> {
 
 /** Submits the handoff as the person's prompt; the finding counts as applied once it entered, and is applicable again if it did not. */
 async function handOff($: $, finding: Finding): Promise<void> {
+  live.inFlight.add(finding.id)
   try {
     const entered = await $.prompt.submit({ text: handoffMessage(finding, await $.clock.now(), await driftNote($, finding)), asUser: true })
     if (entered.drop !== undefined) {
@@ -1922,6 +1933,8 @@ async function handOff($: $, finding: Finding): Promise<void> {
     await log($, `#${finding.id} was not handed over: ${messageOf(error)}`)
     await setStatus($, finding.id, 'new')
     $.ui.toast(`stress-scout could not hand #${finding.id} to Claude: ${clip(messageOf(error), 120)}`, { timeoutMs: 8000 })
+  } finally {
+    live.inFlight.delete(finding.id)
   }
 }
 
@@ -2160,6 +2173,7 @@ async function onSessionStart($: $): Promise<void> {
   }
   // a handoff awaited by the module before this one never reports back: let the person press Apply again
   const stuck = (await read($, findingsAtom)).filter(f => f.status === 'handing')
+  live.inFlight.clear()
   for (const f of stuck) {
     await log($, `#${f.id}: stress-scout reloaded mid-handoff; Apply is offered again (check the prompt did not already go in)`)
     await setStatus($, f.id, 'new')
