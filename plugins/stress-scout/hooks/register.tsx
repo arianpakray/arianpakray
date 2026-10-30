@@ -1839,9 +1839,12 @@ async function autoOpenPane($: $): Promise<void> {
   live.isPaneShown = opened.isPlaced
 }
 
+/** /stress show: the pane where something can draw it, else the findings as text. */
 async function openPane($: $): Promise<string> {
-  await $.ui.open({ id: PANE, title: 'Stress Scout' })
-  return 'Stress Scout pane opened.'
+  const noPane = async (): Promise<string> => `No window is attached to draw the Stress Scout pane, so here is the status instead.\n${await statusText($)}`
+  if ((await $.session.surfaces()).length === 0) return noPane()
+  const opened = await $.ui.open({ id: PANE, title: 'Stress Scout' }).catch(() => ({ isPlaced: false }))
+  return opened.isPlaced ? 'Stress Scout pane opened.' : noPane()
 }
 
 /** What the next automatic run waits on, in words. */

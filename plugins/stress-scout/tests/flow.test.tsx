@@ -510,6 +510,11 @@ test('a session with no surface attached does not try to place the pane', { time
   w.surfaces = []
   await $.session.start({ cwd: ROOT, surface: null, isInteractive: false })
   expect(w.opened).toEqual([])
+  // /stress show answers with the status rather than claiming a pane it could not place
+  const shown = await $.command.run(stress('show') as never)
+  expect(w.opened).toEqual([])
+  expect(shown.text).toContain('No window is attached')
+  expect(shown.text).toContain('automatic runs 0/8')
 })
 
 test('/stress start runs a test, as /stress run does', { timeoutMs: 30_000 }, async ($, on) => {

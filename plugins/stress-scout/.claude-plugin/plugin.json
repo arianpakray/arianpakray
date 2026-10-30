@@ -1,6 +1,6 @@
 {
   "name": "stress-scout",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Watches your code while it's being written; when something risky changes or the session goes idle, it stress-tests it in a sandbox copy and offers a fix it has already verified.",
   "author": { "name": "arianpakray" },
   "types": "./types/index.d.ts",
